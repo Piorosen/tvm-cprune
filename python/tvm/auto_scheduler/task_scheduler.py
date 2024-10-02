@@ -260,7 +260,13 @@ class TaskScheduler:
         self.ct = self.best_ct = self.best_score = self.tic = None
         self.num_measures_per_round = None
         self.dead_tasks = set()
-
+        
+        # Pruning filters
+        self.best_measure_inputs = []
+        self.core = {}
+        self.output = {}
+        self.prune_num = {}
+        
         # Build similarity groups
         self.task_tags = []  # task_id -> tag
         self.tag_to_group_id = {}  # tag -> group_id
@@ -447,6 +453,108 @@ class TaskScheduler:
                         + " measurement trials."
                     )
                 break
+
+        # CPrune
+        core_key = {}
+        output_keys = {}
+        for i in range(len(self.best_measure_inputs)):
+            init_state = self.best_measure_inputs[i].task.compute_dag.init_state
+            for j in range(len(init_state.stages)):
+                if str(init_state.stages[j].op.name) == "Conv2dOutput" or str(init_state.stages[j].op.name) == "inverse":
+                    self.core[i] = {}
+                    self.output[i] = {}
+                    output_keys[i] = []
+            for j in range(len(init_state.stages)):
+                if str(init_state.stages[j].op.name) == "Conv2dOutput" or str(init_state.stages[j].op.name) == "inverse":
+                    init_stage = init_state.stages[j]
+                    key_idx = 0
+                    for k in range(len(init_stage.iters)):
+                        init_iter = init_stage.iters[k]
+                        if int(init_iter.range.extent) > 1:
+                            if key_idx == 2:
+                                core_key[i] = str(init_iter.name)
+                            self.core[i][str(init_iter.name)] = int(init_iter.range.extent)
+                            key_idx += 1
+                if str(init_state.stages[j].op.name) == "conv2d_winograd" or str(init_state.stages[j].op.name) == "T_relu" or (i in self.output and j == len(init_state.stages) - 1):
+                    init_stage = init_state.stages[j]
+                    key_idx = 0
+                    for k in range(len(init_stage.iters)):
+                        init_iter = init_stage.iters[k]
+                        if int(init_iter.range.extent) > 1:
+                            output_keys[i].append(str(init_iter.name))
+                            self.output[i][str(init_iter.name)] = int(init_iter.range.extent)
+                            key_idx += 1
+                    if core_key[i] != "ff":
+                        core_key[i] = output_keys[i][2]
+                    break  
+
+        for i in range(len(self.best_measure_inputs)):
+            cand1 = []
+            cand2 = []
+            state = self.best_measure_inputs[i].state
+            for j in range(len(state.stages)):
+                stage = state.stages[j]
+                if str(state.stages[j].op.name) == "Conv2dOutput" or str(state.stages[j].op.name) == "inverse":
+                    for k in range(len(stage.iters)):
+                        temp_split = str(stage.iters[k].name).split(".")[0]
+                        if temp_split == core_key[i]:
+                            temp_range = int(stage.iters[k].range.extent)
+                            if temp_range > 1:
+                                cand1.append(temp_range)
+                            if temp_split in self.core[i]:
+                                if self.core[i][temp_split] / temp_range == 1:
+                                    del self.core[i][temp_split]
+                                else:
+                                    self.core[i][temp_split] /= temp_range
+                    if core_key[i] in self.core[i]:
+                        cand1.append(int(self.core[i][core_key[i]]))
+                if str(state.stages[j].op.name) == "conv2d_winograd" or str(state.stages[j].op.name) == "T_relu" or (i in self.output and j == len(state.stages) - 1):
+                    for k in reversed(range(len(stage.iters))):
+                        if k != 0:
+                            temp_split = str(stage.iters[k].name).split(".")[0]
+                            if temp_split not in output_keys[i] and temp_split != "ax3":
+                                continue
+                            temp_range = int(stage.iters[k].range.extent)
+                            if temp_range > 1:
+                                if temp_split == output_keys[i][2] or temp_split == "ax3":
+                                    cand2.append(temp_range)
+                                if self.output[i][temp_split] / temp_range == 1:
+                                    del self.output[i][temp_split]
+                                else:
+                                    self.output[i][temp_split] /= temp_range
+                        else:
+                            temp_range = int(stage.iters[k].range.extent)
+                            if output_keys[i][0] in self.output[i] and temp_range % self.output[i][output_keys[i][0]] == 0:
+                                temp_range /= self.output[i][output_keys[i][0]]
+                            if output_keys[i][1] in self.output[i] and temp_range % self.output[i][output_keys[i][1]] == 0:
+                                temp_range /= self.output[i][output_keys[i][1]]
+                            if temp_range > 1:
+                                cand2.append(int(temp_range))
+                    break
+            if bool(cand1):
+                if len(cand1) == 1:
+                    cand1.append(1)
+                if len(cand2) == 1:
+                    cand2.append(1)
+                cand1_max = 1 if cand1 == [] else max(cand1)
+                cand2_max = 1 if cand2 == [] else max(cand2)
+                cand1_result = 1
+                cnt = 1
+                for j in cand1:
+                    if j != cand1_max or cnt == 0:
+                        cand1_result *= j
+                    else:
+                        cnt = 0
+                cand2_result = 1
+                cnt = 1
+                for j in cand2:
+                    if j != cand2_max or cnt == 0:
+                        cand2_result *= j
+                    else:
+                        cnt = 0
+                self.prune_num[i] = max(cand1_result, cand2_result)
+
+
 
     def _tune_task(self, task_idx):
         """Tune the select task for one round"""
