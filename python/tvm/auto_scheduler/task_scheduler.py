@@ -568,13 +568,25 @@ class TaskScheduler:
         )
 
         self.task_cts[task_idx] += 1
-
+        ## CPrune
+        best_idx = -1
+        temp_idx = 0
+        ## 
+        
         for res in measure_results:
             cost = array_mean(res.costs)
             if cost < self.best_costs[task_idx]:
                 self.task_best_cts[task_idx] = self.task_cts[task_idx]
                 self.best_costs[task_idx] = cost
-
+        ##  CPrune
+            temp_idx += 1
+            
+        if(len(self.best_measure_inputs) <= task_idx):
+            self.best_measure_inputs.append(measure_inputs[best_idx])
+        elif best_idx > -1:
+            self.best_measure_inputs[task_idx] = measure_inputs[best_idx]
+        ## 
+                
         # Stop tuning this task in the rest of the process if its search space has been
         # fully explored or it has no improvement for a long while.
         no_change_trials = (
