@@ -48,7 +48,6 @@ def sparse_reshape(
     Examples
     --------
     .. code-block:: python
-
         sparse_indices = [[0, 0, 0],
                             [0, 0, 1],
                             [0, 1, 0],

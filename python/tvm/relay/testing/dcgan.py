@@ -27,7 +27,6 @@ Radford, Alec, Luke Metz, and Soumith Chintala.
 arXiv preprint arXiv:1511.06434 (2015).
 """
 from tvm import relay
-
 from . import layers
 from .init import create_workload
 
@@ -42,7 +41,7 @@ def deconv2d(data, ishape, oshape, kshape, layout, name, stride=(2, 2)):
     adj_x = (target_shape[1] + 2 * pad_x - kshape[1]) % stride[1]
 
     if layout == "NCHW":
-        kernel_layout = "IOHW"
+        kernel_layout = "OIHW"
     elif layout == "NHWC":
         kernel_layout = "HWOI"
     else:

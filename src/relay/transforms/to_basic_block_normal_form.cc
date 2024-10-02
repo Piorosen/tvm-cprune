@@ -30,36 +30,45 @@
 
 #include "../../support/arena.h"
 #include "../analysis/dependency_graph.h"
-#include "./pass_utils.h"
+#include "let_list.h"
+#include "pass_utils.h"
 
 namespace tvm {
 namespace relay {
 
+Expr ToBasicBlockNormalFormAux(const Expr& e) {
+  // calculate all the dependency between nodes.
+  support::Arena arena;
+  DependencyGraph dg = DependencyGraph::Create(&arena, e);
+  /* The scope of the whole expr is global.
+   * The scope of any subexpr, is the lowest common ancestor of all incoming edge.
+   * We also record the set of expressions whose scope is lifted.
+   */
+  std::pair<NodeScopeMap, ExprSet> scopes = CalcScope(dg);
+  return Fill::ToBasicBlockNormalForm(e, dg, &scopes.first, &scopes.second);
+}
+
 IRModule ToBasicBlockNormalForm(const IRModule& mod) {
-  // Create a new module by shallow copy.
-  IRModule new_mod = mod->ShallowCopy();
+  DLOG(INFO) << "ToBBlock:" << std::endl << mod;
 
   tvm::Map<GlobalVar, Function> updates;
-  auto funcs = new_mod->functions;
+  auto funcs = mod->functions;
   for (const auto& it : funcs) {
     ICHECK_EQ(FreeVars(it.second).size(), 0) << "Expected no free variables";
     if (const auto* n = it.second.as<FunctionNode>()) {
       if (n->GetAttr<String>(attr::kCompiler).defined()) continue;
-      Function func = GetRef<Function>(n);
-      Function ret = Downcast<Function>(ToBasicBlockNormalFormAux(func));
-      VLOG(1) << "rewritten:" << std::endl
-              << PrettyPrint(func) << std::endl
-              << "to BasicBlockANF:" << std::endl
-              << PrettyPrint(ret);
-      updates.Set(it.first, Downcast<Function>(ret));
     }
+    Expr ret = TransformF([&](const Expr& e) { return ToBasicBlockNormalFormAux(e); }, it.second);
+    updates.Set(it.first, Downcast<Function>(ret));
   }
 
   for (auto pair : updates) {
-    new_mod->Add(pair.first, pair.second, true);
+    mod->Add(pair.first, pair.second, true);
   }
 
-  return new_mod;
+  DLOG(INFO) << "ToBBlock: transformed" << std::endl << mod;
+
+  return mod;
 }
 
 bool BasicBlockNormalFormCheck(const Expr& e) {

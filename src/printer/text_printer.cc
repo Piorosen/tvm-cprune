@@ -58,7 +58,6 @@ Doc TextPrinter::PrintMod(const IRModule& mod) {
       os << "def @" << kv.first->name_hint;
       doc << relay_text_printer_.PrintFunc(Doc::Text(os.str()), kv.second);
     } else if (kv.second.as<tir::PrimFuncNode>()) {
-      doc << "@" << kv.first->name_hint << " = ";
       doc << tir_text_printer_.PrintPrimFunc(Downcast<tir::PrimFunc>(kv.second));
     }
     doc << Doc::NewLine();
@@ -68,7 +67,7 @@ Doc TextPrinter::PrintMod(const IRModule& mod) {
 
 String PrettyPrint(const ObjectRef& node) {
   Doc doc;
-  doc << TextPrinter(/*show_meta_data=*/false, nullptr, false).PrintFinal(node);
+  doc << TextPrinter(false, nullptr, false).PrintFinal(node);
   return doc.str();
 }
 

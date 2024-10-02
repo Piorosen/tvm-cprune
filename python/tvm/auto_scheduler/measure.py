@@ -43,9 +43,7 @@ from tvm.runtime import Object, module, ndarray
 from tvm.driver import build_module
 from tvm.ir import transform
 from tvm.autotvm.measure.measure_methods import set_cuda_target_arch
-from tvm.autotvm.env import AutotvmGlobalScope, reset_global_scope
 from tvm.contrib import tar, ndk
-from tvm.contrib.popen_pool import PopenWorker, PopenPoolExecutor, StatusKind
 from tvm.target import Target
 
 
@@ -86,7 +84,7 @@ class BuildFunc:
 
 @tvm._ffi.register_object("auto_scheduler.MeasureCallback")
 class MeasureCallback(Object):
-    """The base class of measurement callback functions."""
+    """ The base class of measurement callback functions. """
 
 
 @tvm._ffi.register_object("auto_scheduler.PythonBasedMeasureCallback")
@@ -246,7 +244,7 @@ def recover_measure_input(inp, rebuild_state=False):
 
 @tvm._ffi.register_object("auto_scheduler.ProgramBuilder")
 class ProgramBuilder(Object):
-    """The base class of ProgramBuilders."""
+    """ The base class of ProgramBuilders. """
 
     def build(self, measure_inputs, verbose=1):
         """Build programs and return results.
@@ -267,7 +265,7 @@ class ProgramBuilder(Object):
 
 @tvm._ffi.register_object("auto_scheduler.ProgramRunner")
 class ProgramRunner(Object):
-    """The base class of ProgramRunners."""
+    """ The base class of ProgramRunners. """
 
     def run(self, measure_inputs, build_results, verbose=1):
         """Run measurement and return results.
@@ -376,7 +374,7 @@ class LocalRunner(ProgramRunner):
         i.e., When the run time of one `repeat` falls below this time, the `number` parameter
         will be automatically increased.
     cooldown_interval : float = 0.0
-        The cool down interval between two measurements in seconds.
+        The cool down interval between two measurements.
     enable_cpu_cache_flush: bool = False
         Whether to flush cache on CPU between repeated measurements.
         Flushing cache can make the measured latency of one operator closer to
@@ -447,7 +445,7 @@ class RPCRunner(ProgramRunner):
         i.e., When the run time of one `repeat` falls below this time, the `number` parameter
         will be automatically increased.
     cooldown_interval : float = 0.0
-        The cool down interval between two measurements in seconds.
+        The cool down interval between two measurements.
     enable_cpu_cache_flush: bool = False
         Whether to flush cache on CPU between repeated measurements.
         Flushing cache can make the measured latency of one operator closer to
@@ -526,7 +524,7 @@ class LocalRPCMeasureContext:
         i.e., When the run time of one `repeat` falls below this time, the `number` parameter
         will be automatically increased.
     cooldown_interval : float = 0.0
-        The cool down interval between two measurements in seconds.
+        The cool down interval between two measurements.
     enable_cpu_cache_flush: bool = False
         Whether to flush cache on CPU between repeated measurements.
         Flushing cache can make the measured latency of one operator closer to
@@ -587,7 +585,7 @@ class LocalRPCMeasureContext:
 
 
 class MeasureErrorNo(object):
-    """Error type for MeasureResult."""
+    """ Error type for MeasureResult. """
 
     NO_ERROR = 0  # No error
     INSTANTIATION_ERROR = 1  # Errors happen when apply transform steps from init state
@@ -601,7 +599,7 @@ class MeasureErrorNo(object):
     UNKNOWN_ERROR = 8  # Unknown error
 
 
-def _local_build_worker(inp_serialized, build_func, verbose):
+def _timed_func(inp_serialized, build_func, verbose):
     tic = time.time()
     inp = MeasureInput.deserialize(inp_serialized)
     task = inp.task
@@ -652,17 +650,31 @@ def local_build_worker(args):
 
     Parameters
     ----------
-    args: Tuple[MeasureInput, callable, int]
-        inputs, build-func, verbose args passed to local_builder_build
+    args: Tuple[MeasureInput, str, int, int]
+        inputs, build-func, time, verbose args passed to local_builder_build
 
     Returns
     -------
     res : BuildResult
         The build result of this Builder thread.
     """
-    inp, build_func, verbose = args
+    inp, build_func, timeout, verbose = args
+    assert build_func == BuildFunc.name, (
+        "BuildFunc.name: " + BuildFunc.name + ", but args is: " + build_func
+    )
+    build_func = BuildFunc.build_func
 
-    return _local_build_worker(inp, build_func, verbose)
+    res = call_func_with_timeout(timeout, _timed_func, args=(inp, build_func, verbose))
+    if isinstance(res, TimeoutError):
+        if verbose >= 1:
+            print(".T", end="", flush=True)  # Build timeout
+        res = None, [], MeasureErrorNo.BUILD_TIMEOUT, None, timeout
+    elif isinstance(res, Exception):
+        if verbose >= 1:
+            print(".E", end="", flush=True)  # Build error
+        res = None, [], MeasureErrorNo.COMPILE_HOST, str(res), timeout
+
+    return res
 
 
 @tvm._ffi.register_func("auto_scheduler.local_builder.build")
@@ -689,40 +701,27 @@ def local_builder_build(inputs, timeout, n_parallel, build_func="default", verbo
     res : List[BuildResult]
         The build results of these MeasureInputs.
     """
-    assert build_func == BuildFunc.name, (
-        "BuildFunc.name: " + BuildFunc.name + ", but args is: " + build_func
-    )
-    executor = PopenPoolExecutor(
-        n_parallel, timeout, reset_global_scope, (AutotvmGlobalScope.current,)
-    )
-    tuple_res = executor.map_with_error_catching(
+    # This pool is not doing computationally intensive work, so we can use threads
+    pool = multiprocessing.pool.ThreadPool(n_parallel)
+    tuple_res = pool.map(
         local_build_worker,
         [
             (
                 i.serialize(),
-                BuildFunc.build_func,
+                build_func,
+                timeout,
                 verbose,
             )
             for i in inputs
         ],
     )
+    pool.terminate()
+    pool.join()
+    del pool
 
     results = []
     for res in tuple_res:
-        if res.status == StatusKind.COMPLETE:
-            results.append(BuildResult(*res.value))
-        elif res.status == StatusKind.TIMEOUT:
-            if verbose >= 1:
-                print(".T", end="", flush=True)  # Build timeout
-            results.append(BuildResult(None, [], MeasureErrorNo.BUILD_TIMEOUT, None, timeout))
-        elif res.status == StatusKind.EXCEPTION:
-            if verbose >= 1:
-                print(".E", end="", flush=True)  # Build error
-            results.append(
-                BuildResult(None, [], MeasureErrorNo.COMPILE_HOST, repr(res.value), timeout)
-            )
-        else:
-            raise ValueError("Result status is not expected. Unreachable branch")
+        results.append(BuildResult(*res))
 
     return results
 
@@ -818,58 +817,9 @@ def prepare_input_map(args):
     return tensor_input_map
 
 
-def prepare_runner_args(inp, build_res):
-    """This function prepares the pre-defined arguments in `TASK_INPUT_BUFFER_TABLE` for local/rpc
-    runner in main process
-
-    Parameters
-    ----------
-    inp : MeasureInput
-        Measure input to be measured.
-
-    build_res : BuildResult
-        Build result to be measured.
-
-    Returns
-    -------
-    List[Optional[numpy.ndarray]] :
-        List of arguments for running the program. If the argument does not have a pre-defined input
-        buffer, None is added to the list as a placeholder.
-
-    """
-    # pylint: disable=import-outside-toplevel
-    from .search_task import get_task_input_buffer  # lazily import to avoid recursive dependency
-
-    task_input_names = inp.task.task_input_names
-    tensor_input_map = prepare_input_map(build_res.args)
-    if not task_input_names:
-        tensor_input_map = {}
-    args = []
-    task_inputs_count = 0
-    for arg in build_res.args:
-        if arg in tensor_input_map:
-            tensor_name = tensor_input_map[arg]
-            if tensor_name in task_input_names:
-                task_input_buffer = get_task_input_buffer(inp.task.workload_key, tensor_name)
-                # convert tvm.NDArray to picklable numpy.ndarray
-                args.append(task_input_buffer.numpy())
-                task_inputs_count += 1
-            else:
-                raise ValueError(
-                    "%s not found in task_inputs, " % (tensor_name)
-                    + "should provide with `SearchTask(..., task_inputs={...})`"
-                )
-        else:
-            args.append(None)
-    if task_inputs_count != len(task_input_names):
-        raise RuntimeError("task_inputs not fully matched, check if there's any unexpected error")
-    return args
-
-
 def _timed_eval_func(
     inp_serialized,
     build_res,
-    args,
     number,
     repeat,
     min_repeat_ms,
@@ -877,7 +827,11 @@ def _timed_eval_func(
     enable_cpu_cache_flush,
     verbose,
 ):
+    # pylint: disable=import-outside-toplevel
+    from .search_task import get_task_input_buffer  # lazily import to avoid recursive dependency
+
     inp = MeasureInput.deserialize(inp_serialized)
+    task_input_names = inp.task.task_input_names
     tic = time.time()
     error_no = 0
     error_msg = None
@@ -901,28 +855,43 @@ def _timed_eval_func(
     # pylint: disable=broad-except
     except Exception:
         costs = (MAX_FLOAT,)
-        error_no = MeasureErrorNo.COMPILE_DEVICE
+        print("COMPILE_DEVICE_1")
+#        error_no = MeasureErrorNo.COMPILE_DEVICE
         error_msg = make_traceback_info()
 
     if error_no == 0:
         try:
             random_fill = tvm.get_global_func("tvm.contrib.random.random_fill", True)
             assert random_fill, "Please make sure USE_RANDOM is ON in the config.cmake"
-            assert len(args) == len(build_res.args)
-            loc_args = []
-            # pylint: disable=consider-using-enumerate
-            for idx in range(len(args)):
-                if args[idx] is None:
-                    build_res_arg = build_res.args[idx]
-                    empty_array = ndarray.empty(
-                        get_const_tuple(build_res_arg.shape), build_res_arg.dtype, dev
-                    )
-                    random_fill(empty_array)
-                    loc_args.append(empty_array)
+
+            tensor_input_map = prepare_input_map(build_res.args) if task_input_names else {}
+            args = []
+            task_inputs_count = 0
+            for arg in build_res.args:
+                if arg in tensor_input_map:
+                    tensor_name = tensor_input_map[arg]
+                    if tensor_name in task_input_names:
+                        args.append(
+                            ndarray.array(
+                                get_task_input_buffer(inp.task.workload_key, tensor_name), dev
+                            )
+                        )
+                        task_inputs_count += 1
+                    else:
+                        raise ValueError(
+                            "%s not found in task_inputs, " % (tensor_name)
+                            + "should provide with `SearchTask(..., task_inputs={...})`"
+                        )
                 else:
-                    loc_args.append(ndarray.array(args[idx], dev))
+                    empty_array = ndarray.empty(get_const_tuple(arg.shape), arg.dtype, dev)
+                    random_fill(empty_array)
+                    args.append(empty_array)
+            if task_inputs_count != len(task_input_names):
+                raise RuntimeError(
+                    "task_inputs not fully matched, check if there's any unexpected error"
+                )
             dev.sync()
-            costs = time_f(*loc_args).results
+            costs = time_f(*args).results
         # pylint: disable=broad-except
         except Exception:
             costs = (MAX_FLOAT,)
@@ -982,7 +951,7 @@ def local_run(
         i.e., When the run time of one `repeat` falls below this time, the `number` parameter
         will be automatically increased.
     cooldown_interval : float = 0.0
-        The cool down interval between two measurements in seconds.
+        The cool down interval between two measurements.
     enable_cpu_cache_flush: bool = False
         Whether to flush cache on CPU between repeated measurements.
         Flushing cache can make the measured latency of one operator closer to
@@ -1000,7 +969,6 @@ def local_run(
 
     measure_results = []
     assert len(inputs) == len(build_results), "Measure input size should be equal to build results"
-    worker = PopenWorker()
     for inp, build_res in zip(inputs, build_results):
         if build_res.error_no != 0:
             res = (
@@ -1011,15 +979,12 @@ def local_run(
                 time.time(),
             )
         else:
-            args = prepare_runner_args(inp, build_res)
             res = call_func_with_timeout(
-                worker,
                 timeout,
                 _timed_eval_func,
                 args=(
                     inp.serialize(),
                     build_res,
-                    args,
                     number,
                     repeat,
                     min_repeat_ms,
@@ -1027,6 +992,7 @@ def local_run(
                     enable_cpu_cache_flush,
                     verbose,
                 ),
+                add_thread_wrapper=True,
             )
             if isinstance(res, TimeoutError):
                 if verbose >= 1:
@@ -1057,10 +1023,9 @@ def local_run(
     return measure_results
 
 
-def _rpc_run(
+def _timed_rpc_run(
     inp_serialized,
     build_res,
-    args,
     key,
     host,
     port,
@@ -1073,7 +1038,11 @@ def _rpc_run(
     enable_cpu_cache_flush,
     verbose,
 ):
+    # pylint: disable=import-outside-toplevel
+    from .search_task import get_task_input_buffer  # lazily import to avoid recursive dependency
+
     inp = MeasureInput.deserialize(inp_serialized)
+    task_input_names = inp.task.task_input_names
     tic = time.time()
     error_no = 0
     error_msg = None
@@ -1100,7 +1069,8 @@ def _rpc_run(
     # pylint: disable=broad-except
     except Exception:
         costs = (MAX_FLOAT,)
-        error_no = MeasureErrorNo.COMPILE_DEVICE
+        print("COMPILE_DEVICE_2")
+#        error_no = MeasureErrorNo.COMPILE_DEVICE
         error_msg = make_traceback_info()
 
     if error_no == 0:
@@ -1112,26 +1082,39 @@ def _rpc_run(
                 random_fill
             ), "Please make sure USE_RANDOM is ON in the config.cmake on the remote devices"
 
-            assert len(args) == len(build_res.args)
-            loc_args = []
-            # pylint: disable=consider-using-enumerate
-            for idx in range(len(args)):
-                if args[idx] is None:
-                    build_res_arg = build_res.args[idx]
-                    empty_array = ndarray.empty(
-                        get_const_tuple(build_res_arg.shape), build_res_arg.dtype, dev
-                    )
-                    random_fill(empty_array)
-                    loc_args.append(empty_array)
+            tensor_input_map = prepare_input_map(build_res.args) if task_input_names else {}
+            args = []
+            task_inputs_count = 0
+            for arg in build_res.args:
+                if arg in tensor_input_map:
+                    tensor_name = tensor_input_map[arg]
+                    if tensor_name in task_input_names:
+                        args.append(
+                            ndarray.array(
+                                get_task_input_buffer(inp.task.workload_key, tensor_name), dev
+                            )
+                        )
+                        task_inputs_count += 1
+                    else:
+                        raise ValueError(
+                            "%s not found in task_inputs, " % (tensor_name)
+                            + "should provide with `SearchTask(..., task_inputs={...})`"
+                        )
                 else:
-                    loc_args.append(ndarray.array(args[idx], dev))
+                    empty_array = ndarray.empty(get_const_tuple(arg.shape), arg.dtype, dev)
+                    random_fill(empty_array)
+                    args.append(empty_array)
+            if task_inputs_count != len(task_input_names):
+                logger.warning(
+                    "task_inputs not fully matched, check if there's any unexpected error"
+                )
             dev.sync()
 
             # First run for check that the kernel is correct
-            func.entry_func(*loc_args)
+            func.entry_func(*args)
             dev.sync()
 
-            costs = time_f(*loc_args).results
+            costs = time_f(*args).results
 
             # clean up remote files
             remote.remove(build_res.filename)
@@ -1153,7 +1136,8 @@ def _rpc_run(
         if error_no == MeasureErrorNo.NO_ERROR:
             print("*", end="")
         else:
-            print("*E", end="")  # Run error
+            # print(error_no)
+            print("E", end="")  # Run error
 
     return costs, error_no, error_msg, toc - tic + build_res.time_cost, toc
 
@@ -1171,7 +1155,7 @@ def _rpc_run_worker(args):
     res : MeasureResult
         The measure result of this Runner thread.
     """
-    _, build_res, _, _, _, _, _, timeout, _, _, _, _, _, verbose = args
+    _, build_res, _, _, _, _, timeout, _, _, _, _, _, verbose = args
     if build_res.error_no != MeasureErrorNo.NO_ERROR:
         return (
             (MAX_FLOAT,),
@@ -1181,16 +1165,24 @@ def _rpc_run_worker(args):
             time.time(),
         )
 
-    try:
-        res = _rpc_run(*args)
-    # pylint: disable=broad-except
-    except Exception:
+    res = call_func_with_timeout(timeout, _timed_rpc_run, args=args)
+    if isinstance(res, TimeoutError):
+        if verbose >= 1:
+            print("*T", end="")  # Run timeout
+        res = (
+            (MAX_FLOAT,),
+            MeasureErrorNo.RUN_TIMEOUT,
+            None,
+            build_res.time_cost + timeout,
+            time.time(),
+        )
+    elif isinstance(res, Exception):
         if verbose >= 1:
             print("*E", end="")  # Run error
         res = (
             (MAX_FLOAT,),
             MeasureErrorNo.RUNTIME_DEVICE,
-            make_traceback_info(),
+            str(res),
             build_res.time_cost + timeout,
             time.time(),
         )
@@ -1253,7 +1245,7 @@ def rpc_runner_run(
         i.e., When the run time of one `repeat` falls below this time, the `number` parameter
         will be automatically increased.
     cooldown_interval : float = 0.0
-        The cool down interval between two measurements in seconds.
+        The cool down interval between two measurements.
     enable_cpu_cache_flush: bool = False
         Whether to flush cache on CPU between repeated measurements.
         Flushing cache can make the measured latency of one operator closer to
@@ -1270,14 +1262,13 @@ def rpc_runner_run(
     """
     assert len(inputs) == len(build_results), "Measure input size should be equal to build results"
     # This pool is not doing computationally intensive work, so we can use threads
-    executor = PopenPoolExecutor(n_parallel)
-    tuple_res = executor.map_with_error_catching(
+    pool = multiprocessing.pool.ThreadPool(n_parallel)
+    tuple_res = pool.map(
         _rpc_run_worker,
         [
             (
                 inp.serialize(),
                 build_res,
-                prepare_runner_args(inp, build_res),
                 key,
                 host,
                 port,
@@ -1293,25 +1284,13 @@ def rpc_runner_run(
             for inp, build_res in zip(inputs, build_results)
         ],
     )
+    pool.terminate()
+    pool.join()
+    del pool
 
     results = []
-    for i, res in enumerate(tuple_res):
-        if res.status == StatusKind.COMPLETE:
-            results.append(MeasureResult(*res.value))
-        else:
-            assert res.status == StatusKind.TIMEOUT
-            if verbose >= 1:
-                print("*T", end="")  # Run timeout
-            build_res = build_results[i]
-            results.append(
-                MeasureResult(
-                    (MAX_FLOAT,),
-                    MeasureErrorNo.RUN_TIMEOUT,
-                    None,
-                    build_res.time_cost + timeout,
-                    time.time(),
-                )
-            )
+    for res in tuple_res:
+        results.append(MeasureResult(*res))
 
     if verbose >= 1:
         print("")

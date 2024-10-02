@@ -37,7 +37,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
 namespace tvm {
 namespace relay {
 
@@ -228,7 +227,7 @@ class ExprMutator : public ::tvm::relay::ExprFunctor<Expr(const Expr&)> {
  *
  * MixedModeVisitor provides the same recursive API as ExprVisitor, and uses
  * recursion to traverse most forms of the IR, but under the hood it expands nested dataflow regions
- * of the graph and processes them iteratively to prevent stack overflows
+ * of the graph and processes them iteratatively to prevent stack overflows
  */
 class MixedModeVisitor : public ::tvm::relay::ExprVisitor {
  public:

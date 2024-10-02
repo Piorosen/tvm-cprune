@@ -21,16 +21,13 @@
 #define TVM_RUNTIME_VULKAN_VULKAN_DEVICE_API_H_
 
 #include <tvm/runtime/device_api.h>
-#include <vulkan/vulkan_core.h>
 
 #include <string>
 #include <vector>
 
-#include "../thread_map.h"
-#include "../workspace_pool.h"
 #include "vulkan/vulkan_core.h"
-#include "vulkan_device.h"
-#include "vulkan_instance.h"
+#include "vulkan_context.h"
+#include "vulkan_thread_entry.h"
 
 namespace tvm {
 namespace runtime {
@@ -71,73 +68,31 @@ class VulkanDeviceAPI final : public DeviceAPI {
   // End of required methods for the DeviceAPI interface
 
  public:
-  /*! \brief Return the currently active VulkanDevice
-   *
-   * The active device can be set using VulkanDeviceAPI::SetDevice.
-   * Each CPU thread has its own active device, mimicking the
-   * semantics of cudaSetDevice.
-   */
-  VulkanDevice& GetActiveDevice();
-
-  /*! \brief Return the currently active VulkanDevice
-   *
-   * The active device can be set using VulkanDeviceAPI::SetDevice.
-   * Each CPU thread has its own active device, mimicking the
-   * semantics of cudaSetDevice.
-   */
-  int GetActiveDeviceID();
-
-  /*! \brief Return the VulkanDevice associated with a specific device_id
+  /*! \brief Return the context associated with a specific device.
    *
    * These are constructed during VulkanDeviceAPI initialization, so
    * this function returns immediately.
    */
-  const VulkanDevice& device(size_t device_id) const;
-
-  /*! \brief Return the VulkanDevice associated with a specific device_id
-   *
-   * These are constructed during VulkanDeviceAPI initialization, so
-   * this function returns immediately.
-   */
-  VulkanDevice& device(size_t device_id);
+  const VulkanContext& context(size_t device_id) const;
 
   /*! \brief Returns a property to be stored in a target.
    *
    * Returns the results of feature/property queries done during the
    * device initialization.
    */
-  void GetTargetProperty(Device dev, const std::string& property, TVMRetValue* rv) final;
+  void GetTargetProperty(Device dev, const std::string& property, TVMRetValue* rv);
 
  private:
   std::vector<uint32_t> GetComputeQueueFamilies(VkPhysicalDevice phy_dev);
 
-  /*! \brief The Vulkan API instance owned by the VulkanDeviceAPI
-   *
-   * Holds and manages VkInstance.
-   */
-  VulkanInstance instance_;
+  std::vector<const char*> FindEnabledExtensions(
+      const std::vector<VkExtensionProperties>& ext_prop,
+      const std::vector<const char*>& required_extensions,
+      const std::vector<const char*>& optional_extensions);
 
-  /*! \brief Handles to the Vulkan devices
-   *
-   * The physical devices.  These are constructed after the instance_,
-   * and must be destructed before the instance_.
-   */
-  std::vector<VulkanDevice> devices_;
-
-  /*! \brief One pool of device memory for each CPU thread.
-   *
-   * These allocate memory based on the devices stored in devices_.
-   * The memory pools must be destructed before devices_.
-   */
-  ThreadMap<WorkspacePool> pool_per_thread;
-
-  /*! \brief The index of the active device for each CPU thread.
-   *
-   * To mimic the semantics of cudaSetDevice, each CPU thread can set
-   * the device on which functions should run.  If unset, the active
-   * device defaults to device_id == 0.
-   */
-  ThreadMap<int> active_device_id_per_thread;
+  VkInstance instance_{nullptr};
+  // The physical devices, have 1 to 1 mapping to devices
+  std::vector<VulkanContext> context_;
 };
 
 }  // namespace vulkan

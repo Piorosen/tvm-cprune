@@ -65,7 +65,7 @@ class LetList {
    */
   Var Push(Var pv, Expr expr) {
     ICHECK(!used_);
-    ICHECK(WellFormed(expr)) << "expression:" << std::endl << PrettyPrint(expr);
+    ICHECK(WellFormed(expr));
     lets_.emplace_back(std::make_pair(pv, expr));
     return pv;
   }

@@ -417,7 +417,7 @@ class Parser {
    * Useful for matching optional tokens, effectively looksahead by one.
    */
   bool WhenMatch(const TokenType& token_type) {
-    VLOG(9) << "Parser::WhenMatch: Peek() == " << Peek();
+    DLOG(INFO) << "Parser::WhenMatch: Peek() == " << Peek();
     if (Peek()->token_type == token_type) {
       Consume(token_type);
       return true;
@@ -524,22 +524,13 @@ class Parser {
   NDArray NumberToNDArray(const Token& token) {
     if (token->token_type == TokenType::kInteger) {
       DLDevice dev = {DLDeviceType::kDLCPU, 0};
-      int64_t i = Downcast<tvm::Integer>(token->data);
-      if (i > std::numeric_limits<int32_t>::max()) {
-        auto dtype = String2DLDataType("int64");
-        auto data = NDArray::Empty({}, dtype, dev);
-        auto array = reinterpret_cast<int64_t*>(data->data);
-        // revisit this, literal node issue.
-        array[0] = i;
-        return data;
-      } else {
-        auto dtype = String2DLDataType("int32");
-        auto data = NDArray::Empty({}, dtype, dev);
-        auto array = reinterpret_cast<int32_t*>(data->data);
-        // revisit this, literal node issue.
-        array[0] = i;
-        return data;
-      }
+      auto dtype = String2DLDataType("int32");
+      auto data = NDArray::Empty({}, dtype, dev);
+      auto array = reinterpret_cast<int32_t*>(data->data);
+      // revisit this, literal node issue.
+      int64_t value = Downcast<tvm::Integer>(token->data);
+      array[0] = (int32_t)value;
+      return data;
     } else if (token->token_type == TokenType::kFloat) {
       DLDevice dev = {DLDeviceType::kDLCPU, 0};
       auto float_imm = Downcast<tvm::FloatImm>(token->data);
@@ -594,7 +585,7 @@ class Parser {
   template <typename R>
   R WithSpan(std::function<R()> parser) {
     auto start_span = Peek()->span;
-    VLOG(9) << "WithSpan: start_span = " << start_span;
+    DLOG(INFO) << "WithSpan: start_span = " << start_span;
     R ast = parser();
     if (ast.defined()) {
       // The token at the head of the stream is now 1 past where we parsed. So we find its start
@@ -608,7 +599,7 @@ class Parser {
         span_pos--;
       }
       auto end_token = tokens.at(span_pos);
-      VLOG(9) << "WithSpan: end_span = " << end_token->span;
+      DLOG(INFO) << "WithSpan: end_span = " << end_token->span;
       ast->span = start_span.Merge(end_token->span);
     }
     return ast;
@@ -668,8 +659,8 @@ class Parser {
   template <typename T>
   Array<T> ParseSequence(TokenType start, TokenType sep, TokenType stop, std::function<T()> parse,
                          std::function<bool()> before_stop = nullptr) {
-    VLOG(9) << "Parser::ParseSequence: start=" << ToString(start) << " sep=" << ToString(sep)
-            << " stop=" << ToString(stop);
+    DLOG(INFO) << "Parser::ParseSequence: start=" << ToString(start) << " sep=" << ToString(sep)
+               << " stop=" << ToString(stop);
     Match(start);
 
     // This is for the empty arguments list case, if we have <start> <leftovers> <stop> token stream
@@ -686,7 +677,7 @@ class Parser {
     if (WhenMatch(stop)) {
       return Array<T>();
     } else {
-      VLOG(9) << "Parser::ParseSequence: parse first";
+      DLOG(INFO) << "Parser::ParseSequence: parse first";
       auto data = parse();
       Array<T> elements = {data};
 
@@ -695,7 +686,7 @@ class Parser {
         // parse '( expr ',' * ')'
       } else if (WhenMatch(sep)) {
         while (true) {
-          VLOG(9) << "Parser::ParseSequence: parse element";
+          DLOG(INFO) << "Parser::ParseSequence: parse element";
           if (WhenMatch(stop)) {
             break;
           } else {
@@ -893,12 +884,12 @@ class Parser {
 
   /*! \brief Parse a single Relay expression. */
   Expr ParseExpr() {
-    VLOG(9) << "Parser::ParseExpr";
+    DLOG(INFO) << "Parser::ParseExpr";
     return WithSpan<Expr>([this] {
       std::vector<Expr> exprs;
 
       while (true) {
-        VLOG(9) << "Parser::ParseExpr: parsing a single expression";
+        DLOG(INFO) << "Parser::ParseExpr: parsing a single expression";
         auto next = Peek();
         switch (next->token_type) {
           // For graph or let, match first rhs, then invoke ParseBindingExpr
@@ -1011,7 +1002,7 @@ class Parser {
     // This ensures for n sequential bindings
     // the call depth will be the same before
     // and after parsing the n bindings.
-    VLOG(9) << "Parser::ParseBindingExpr";
+    DLOG(INFO) << "Parser::ParseBindingExpr";
     std::vector<std::tuple<Var, Expr, Span>> bindings;
     int scopes = 0;
 
@@ -1085,13 +1076,15 @@ class Parser {
    * Handles things of the form [T1, ..., TN](arg1: U1, ..., argN : UN) -> Ret { body }.
    */
   Function ParseFunctionDef() {
-    VLOG(9) << "Parser::ParseFunctionDef";
+    DLOG(INFO) << "Parser::ParseFunctionDef";
     return WithSpan<Function>([&]() {
       PushScope();
       PushTypeScope();
 
       Array<TypeVar> generics;
       if (Peek()->token_type == TokenType::kLSquare) {
+        // If we have generics we need to add a type scope.
+        PushTypeScope();
         generics = ParseSequence<TypeVar>(
             TokenType::kLSquare, TokenType::kComma, TokenType::kRSquare, [&]() {
               auto type_var_name = Match(TokenType::kIdentifier).ToString();
@@ -1147,7 +1140,7 @@ class Parser {
   /*! \brief Parse an if-expression. */
   Expr ParseIf() {
     return WithSpan<Expr>([&]() {
-      VLOG(9) << "Parser::ParseIf";
+      DLOG(INFO) << "Parser::ParseIf";
       Consume(TokenType::kIf);
 
       auto guard = WithSpan<Expr>([&] { return Parens<Expr>([&] { return ParseExpr(); }); });
@@ -1186,7 +1179,7 @@ class Parser {
    * This function recursively parses a pattern.
    */
   Pattern ParsePattern() {
-    VLOG(9) << "Parser::ParsePattern";
+    DLOG(INFO) << "Parser::ParsePattern";
     auto next = Peek();
     switch (next->token_type) {
       case TokenType::kUnderscore: {
@@ -1249,7 +1242,7 @@ class Parser {
   }
 
   Expr ParseExprBinOp() {
-    VLOG(9) << "Parser::ParseExprBinOp";
+    DLOG(INFO) << "Parser::ParseExprBinOp";
     return WithSpan<Expr>([this] {
       // We must parse at least one expression, the default
       // case is that there is no operator and we will fall
@@ -1333,7 +1326,7 @@ class Parser {
   }
 
   ObjectRef ParseAttributeValue() {
-    VLOG(9) << "Parser::ParseAttributeValue";
+    DLOG(INFO) << "Parser::ParseAttributeValue";
     auto next = Peek();
     switch (next->token_type) {
       case TokenType::kFloat:
@@ -1375,7 +1368,7 @@ class Parser {
   }
 
   Map<String, ObjectRef> ParseAttrs() {
-    VLOG(9) << "Parser::ParseAttrs";
+    DLOG(INFO) << "Parser::ParseAttrs";
     Map<String, ObjectRef> kwargs;
     while (Peek()->token_type == TokenType::kIdentifier) {
       auto key = GetHierarchicalName(ParseHierarchicalName().data);
@@ -1387,14 +1380,14 @@ class Parser {
       kwargs.Set(key, value);
       WhenMatch(TokenType::kComma);
     }
-    VLOG(9) << "Parser::ParseAttrs: kwargs=" << kwargs;
+    DLOG(INFO) << "Parser::ParseAttrs: kwargs=" << kwargs;
     return kwargs;
   }
 
   Expr ParseCallArgs(Expr op) {
     ICHECK(op.defined()) << "the operator must be defined";
 
-    VLOG(9) << "Parser::ParseCallArgs";
+    DLOG(INFO) << "Parser::ParseCallArgs";
     Attrs attrs;
     std::string op_key;
     bool is_op = false;
@@ -1437,15 +1430,11 @@ class Parser {
                   String attr_key = Downcast<String>(raw_attrs["attrs_type_key"]);
                   if (attr_key.size()) {
                     raw_attrs.erase("attrs_type_key");
-                    auto attr_obj =
-                        tvm::ReflectionVTable::Global()->CreateObject(attr_key, raw_attrs);
+                    auto tbl = tvm::ReflectionVTable::Global();
+                    auto attr_obj = tbl->CreateObject(attr_key, raw_attrs);
                     ICHECK(attr_obj.defined());
                     attrs = Downcast<Attrs>(attr_obj);
                   }
-                } else {
-                  this->diag_ctx.EmitFatal(Diagnostic::Error(op->span)
-                                           << "unable to determine the 'attrs_type_key' with which "
-                                              "to represent the call attributes for this operator");
                 }
               }
               return true;
@@ -1471,7 +1460,7 @@ class Parser {
   }
 
   Expr ParseCallExpr() {
-    VLOG(9) << "Parser::ParseCallExpr";
+    DLOG(INFO) << "Parser::ParseCallExpr";
     return WithSpan<Expr>([this] {
       Expr expr = ParseAtomicExpr();
       // Parse as many call args as possible, building up expression
@@ -1500,7 +1489,7 @@ class Parser {
   }
 
   Expr GetOp(const std::string& op_name, const Span& span) {
-    VLOG(9) << "op_name=" << op_name << " span=" << span;
+    DLOG(INFO) << "op_name=" << op_name << " span=" << span;
     try {
       return Op::Get(op_name);
     } catch (const Error& e) {
@@ -1513,7 +1502,7 @@ class Parser {
   }
 
   Expr ParseAtomicExpr() {
-    VLOG(9) << "Parser::ParseAtomicExpr";
+    DLOG(INFO) << "Parser::ParseAtomicExpr";
     Expr expr = WithSpan<Expr>([this] {
       auto next = Peek();
       switch (next->token_type) {
@@ -1527,7 +1516,7 @@ class Parser {
         }
         case TokenType::kBoolean: {
           Consume(TokenType::kBoolean);
-          int64_t value = Downcast<tvm::Integer>(next->data);
+          int value = Downcast<tvm::Integer>(next->data);
           auto boolean = BooleanToNDarray(value);
           Expr e = Constant(boolean, next->span);
           ICHECK(e->span.defined()) << "constant spans must be defined";
@@ -1649,7 +1638,7 @@ class Parser {
       auto token = Match(TokenType::kInteger);
       auto index = token.ToNumber();
       auto span = token->span.Merge(expr->span);
-      VLOG(9) << "Parser::ParseAtomicExpr: tuple get item";
+      DLOG(INFO) << "Parser::ParseAtomicExpr: tuple get item";
       return relay::TupleGetItem(expr, index, span);
     } else {
       return expr;
@@ -1869,8 +1858,9 @@ class Parser {
 };
 
 Parser InitParser(const std::string& file_name, const std::string& file_content,
-                  const Optional<IRModule>& init_module, const MetaTable& init_meta_table) {
-  VLOG(9) << "InitParser: file_name: " << file_name << "file_content_size: " << file_content.size();
+                  Optional<IRModule> init_module) {
+  DLOG(INFO) << "InitParser: file_name: " << file_name
+             << "file_content_size: " << file_content.size();
   SourceName src_name = SourceName::Get(file_name);
   Source source(src_name, file_content);
 
@@ -1888,33 +1878,19 @@ Parser InitParser(const std::string& file_name, const std::string& file_content,
   auto tokens_and_table = Tokenize(diag_ctx, source);
 
   auto tokens = tokens_and_table.first;
-  MetaTable meta_data_table = tokens_and_table.second.ToMetadata();
+  auto meta_data_table = tokens_and_table.second;
 
-  // Merge any entries in init_meta_table into anything captured in the #[metadata] section
-  // of the file_content. Metadata references within file_content must use indexes which account
-  // for this ordering.
-  for (const auto& pair : init_meta_table) {
-    Array<ObjectRef> items;
-    if (meta_data_table.count(pair.first)) {
-      items = meta_data_table[pair.first];
-    }
-    for (const auto& obj : pair.second) {
-      items.push_back(obj);
-    }
-    meta_data_table.Set(pair.first, items);
-  }
-
-  return Parser(module, diag_ctx, source, tokens, DefaultOpTable(), std::move(meta_data_table));
+  return Parser(module, diag_ctx, source, tokens, DefaultOpTable(), meta_data_table.ToMetadata());
 }
 
-IRModule ParseModule(const std::string& file_name, const std::string& file_content,
-                     const Optional<IRModule>& init_module, const MetaTable& init_meta_table) {
-  VLOG(9) << "ParseModule";
-  auto parser = InitParser(file_name, file_content, init_module, init_meta_table);
+IRModule ParseModule(std::string file_name, std::string file_content,
+                     Optional<IRModule> init_module) {
+  DLOG(INFO) << "ParseModule";
+  auto parser = InitParser(file_name, file_content, init_module);
   auto mod = parser.ParseModule();
   ICHECK(mod.defined()) << "The parser must return a non-null module.";
-  // NB(@jroesch): it is very important that we render any errors before we proceed
-  // if there were any errors which allow the parser to proceed we must render them
+  // NB(@jroesch): it is very important that we render any errors before we procede
+  // if there were any errors which allow the parser to procede we must render them
   // here.
   parser.diag_ctx.Render();
   auto infer_type = tvm::relay::transform::InferType();
@@ -1922,28 +1898,22 @@ IRModule ParseModule(const std::string& file_name, const std::string& file_conte
   return infer_type(mod);
 }
 
-Expr ParseExpr(const std::string& file_name, const std::string& file_content) {
-  VLOG(9) << "ParseExpr";
-  auto parser = InitParser(file_name, file_content, Optional<IRModule>(), MetaTable());
+Expr ParseExpr(std::string file_name, std::string file_content) {
+  DLOG(INFO) << "ParseExpr";
+  auto parser = InitParser(file_name, file_content, Optional<IRModule>());
   parser.ParseSemVer(false);
   parser.PushScope();
   auto expr = parser.ParseExpr();
   parser.Match(TokenType::kEndOfFile);
-  // NB(@jroesch): it is very important that we render any errors before we proceed
-  // if there were any errors which allow the parser to proceed we must render them
+  // NB(@jroesch): it is very important that we render any errors before we procede
+  // if there were any errors which allow the parser to procede we must render them
   // here.
   parser.diag_ctx.Render();
   return expr;
 }
 
-TVM_REGISTER_GLOBAL("parser.ParseModuleInContext")
-    .set_body_typed([](const std::string& file_name, const std::string& file_content,
-                       const Optional<IRModule>& init_module, const MetaTable& init_meta_table) {
-      return ParseModule(file_name, file_content, init_module, init_meta_table);
-    });
-
 TVM_REGISTER_GLOBAL("parser.ParseModule")
-    .set_body_typed([](const std::string& file_name, const std::string& file_content) {
+    .set_body_typed([](tvm::String file_name, tvm::String file_content) {
       return ParseModule(file_name, file_content);
     });
 
@@ -1955,8 +1925,7 @@ TVM_REGISTER_GLOBAL("parser.ParseExpr")
 TVM_REGISTER_GLOBAL("relay._transform.AnnotateSpans").set_body_typed([]() {
   return CreateModulePass(
       [](const IRModule& mod, const PassContext& ctx) {
-        String text = AsText(mod, /*show_meta_data=*/true);
-        VLOG(1) << "AnnotateSpans intermediate text:" << std::endl << text;
+        auto text = AsText(mod, true);
         return ParseModule("GeneratedSource", text);
       },
       0, "AnnotateSpans", {});

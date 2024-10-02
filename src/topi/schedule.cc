@@ -29,6 +29,7 @@
 #include <tvm/target/generic_func.h>
 #include <tvm/topi/cuda/dense.h>
 #include <tvm/topi/cuda/injective.h>
+#include <tvm/topi/cuda/normalization.h>
 #include <tvm/topi/cuda/pooling.h>
 #include <tvm/topi/cuda/reduction.h>
 #include <tvm/topi/cuda/softmax.h>
@@ -38,6 +39,7 @@
 #include <tvm/topi/generic/injective.h>
 #include <tvm/topi/rocm/dense.h>
 #include <tvm/topi/rocm/injective.h>
+#include <tvm/topi/rocm/normalization.h>
 #include <tvm/topi/rocm/pooling.h>
 #include <tvm/topi/rocm/reduction.h>
 #include <tvm/topi/rocm/softmax.h>
@@ -137,6 +139,10 @@ TVM_REGISTER_GLOBAL("topi.rocm.schedule_softmax").set_body([](TVMArgs args, TVMR
   *rv = topi::rocm::schedule_softmax(args[0], args[1]);
 });
 
+TVM_REGISTER_GLOBAL("topi.rocm.schedule_lrn").set_body([](TVMArgs args, TVMRetValue* rv) {
+  *rv = topi::rocm::schedule_lrn(args[0]);
+});
+
 /* CUDA schedules */
 TVM_REGISTER_GLOBAL("topi.cuda.dense_cuda").set_body([](TVMArgs args, TVMRetValue* rv) {
   *rv = cuda::dense_cuda(args[0], args[1], args[2], args[3], args[4]);
@@ -169,6 +175,10 @@ TVM_REGISTER_GLOBAL("topi.cuda.schedule_reduce").set_body([](TVMArgs args, TVMRe
 
 TVM_REGISTER_GLOBAL("topi.cuda.schedule_softmax").set_body([](TVMArgs args, TVMRetValue* rv) {
   *rv = topi::cuda::schedule_softmax(args[0], args[1]);
+});
+
+TVM_REGISTER_GLOBAL("topi.cuda.schedule_lrn").set_body([](TVMArgs args, TVMRetValue* rv) {
+  *rv = topi::cuda::schedule_lrn(args[0]);
 });
 
 /* Utility functions */

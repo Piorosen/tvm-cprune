@@ -41,7 +41,7 @@ CONDA_BUILD = os.getenv("CONDA_BUILD") is not None
 def get_lib_path():
     """Get library path, name and version"""
     # We can not import `libinfo.py` in setup.py directly since __init__.py
-    # Will be invoked which introduces dependencies
+    # Will be invoked which introduces dependences
     libinfo_py = os.path.join(CURRENT_DIR, "./tvm/_ffi/libinfo.py")
     libinfo = {"__file__": libinfo_py}
     exec(compile(open(libinfo_py, "rb").read(), libinfo_py, "exec"), libinfo, libinfo)
@@ -49,29 +49,13 @@ def get_lib_path():
     if not CONDA_BUILD:
         lib_path = libinfo["find_lib_path"]()
         libs = [lib_path[0]]
-        if "runtime" not in libs[0]:
+        if libs[0].find("runtime") == -1:
             for name in lib_path[1:]:
-                if "runtime" in name:
+                if name.find("runtime") != -1:
                     libs.append(name)
                     break
-
-        # Add standalone_crt, if present
-        for name in lib_path:
-            candidate_path = os.path.join(os.path.dirname(name), "standalone_crt")
-            if os.path.isdir(candidate_path):
-                libs.append(candidate_path)
-                break
-
-        # Add microTVM template projects
-        for name in lib_path:
-            candidate_path = os.path.join(os.path.dirname(name), "microtvm_template_projects")
-            if os.path.isdir(candidate_path):
-                libs.append(candidate_path)
-                break
-
     else:
         libs = None
-
     return libs, version
 
 
@@ -170,16 +154,9 @@ setup_kwargs = {}
 if wheel_include_libs:
     with open("MANIFEST.in", "w") as fo:
         for path in LIB_LIST:
-            if os.path.isfile(path):
-                shutil.copy(path, os.path.join(CURRENT_DIR, "tvm"))
-                _, libname = os.path.split(path)
-                fo.write(f"include tvm/{libname}\n")
-
-            if os.path.isdir(path):
-                _, libname = os.path.split(path)
-                shutil.copytree(path, os.path.join(CURRENT_DIR, "tvm", libname))
-                fo.write(f"recursive-include tvm/{libname} *\n")
-
+            shutil.copy(path, os.path.join(CURRENT_DIR, "tvm"))
+            _, libname = os.path.split(path)
+            fo.write("include tvm/%s\n" % libname)
     setup_kwargs = {"include_package_data": True}
 
 if include_libs:
@@ -229,10 +206,4 @@ if wheel_include_libs:
     os.remove("MANIFEST.in")
     for path in LIB_LIST:
         _, libname = os.path.split(path)
-        path_to_be_removed = f"tvm/{libname}"
-
-        if os.path.isfile(path_to_be_removed):
-            os.remove(path_to_be_removed)
-
-        if os.path.isdir(path_to_be_removed):
-            shutil.rmtree(path_to_be_removed)
+        os.remove("tvm/%s" % libname)

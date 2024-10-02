@@ -130,11 +130,12 @@ IRModule FunctionPassNode::operator()(IRModule mod, const PassContext& pass_ctx)
 
   ICHECK(mod.defined());
 
-  VLOG_CONTEXT << pass_info->name;
-  VLOG(0) << "Executing function pass with opt level: " << pass_info->opt_level;
-  VLOG(1) << "Input module:" << std::endl << PrettyPrint(mod);
+  DLOG(INFO) << "Executing function pass : " << pass_info->name
+             << " with opt level: " << pass_info->opt_level;
 
-  IRModule updated_mod = mod->ShallowCopy();
+  // Execute the pass function and return a new module.
+  IRModule updated_mod =
+      IRModule(mod->functions, mod->type_definitions, mod->Imports(), mod->source_map);
 
   std::vector<std::pair<GlobalVar, Function> > updates;
   for (const auto& it : updated_mod->functions) {
@@ -155,8 +156,6 @@ IRModule FunctionPassNode::operator()(IRModule mod, const PassContext& pass_ctx)
 
   pass_ctx->diag_ctx.value().Render();
   pass_ctx->diag_ctx = previous;
-
-  VLOG(1) << "Output module:" << std::endl << PrettyPrint(updated_mod);
 
   // TODO(@jroesch): move away from eager type checking for performance reasons
   // make issue.

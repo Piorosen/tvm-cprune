@@ -119,14 +119,14 @@ Allocator* MemoryManager::GetOrCreateAllocator(Device dev, AllocatorType type) {
     std::unique_ptr<Allocator> alloc;
     switch (type) {
       case kNaive: {
-        VLOG(1) << "New naive allocator for " << DeviceName(dev.device_type) << "(" << dev.device_id
-                << ")";
+        DLOG(INFO) << "New naive allocator for " << DeviceName(dev.device_type) << "("
+                   << dev.device_id << ")";
         alloc.reset(new NaiveAllocator(dev));
         break;
       }
       case kPooled: {
-        VLOG(1) << "New pooled allocator for " << DeviceName(dev.device_type) << "("
-                << dev.device_id << ")";
+        DLOG(INFO) << "New pooled allocator for " << DeviceName(dev.device_type) << "("
+                   << dev.device_id << ")";
         alloc.reset(new PooledAllocator(dev));
         break;
       }

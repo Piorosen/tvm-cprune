@@ -59,4 +59,3 @@ from .scan import *
 from .sparse_reshape import *
 from .transform import *
 from .unique import *
-from .searchsorted import *

@@ -33,7 +33,7 @@
 
 #include "../../target/func_registry_generator.h"
 #include "../../target/source/codegen_source_base.h"
-#include "te_compiler.h"
+#include "compile_engine.h"
 #include "utils.h"
 
 namespace tvm {
@@ -43,6 +43,7 @@ Pass LabelOps();
 }
 namespace backend {
 
+using TargetsMap = Map<tvm::Integer, tvm::Target>;
 using namespace tvm::relay::transform;
 
 /*!
@@ -55,9 +56,9 @@ struct BuildOutput {
 };
 
 struct ExecutorCodegen {
-  void Init(runtime::Module* m, TargetMap targets) { CallFunc("init", m, targets); }
+  void Init(runtime::Module* m, TargetsMap targets) { CallFunc("init", m, targets); }
 
-  void Codegen(const Function& func, String mod_name) { CallFunc("codegen", func, mod_name); }
+  void Codegen(const Function& func) { CallFunc("codegen", func); }
 
   virtual void UpdateOutput(BuildOutput* ret) = 0;
 
@@ -91,8 +92,8 @@ struct ExecutorCodegen {
     return CallFunc<Array<tvm::runtime::Module>>("get_external_modules", nullptr);
   }
 
-  Map<Target, IRModule> GetIRModule() {
-    return CallFunc<Map<Target, IRModule>>("get_irmodule", nullptr);
+  Map<String, IRModule> GetIRModule() {
+    return CallFunc<Map<String, IRModule>>("get_irmodule", nullptr);
   }
 
   runtime::Metadata GetMetadata() { return CallFunc<runtime::Metadata>("get_metadata"); }
@@ -176,8 +177,8 @@ class RelayBuildModule : public runtime::ModuleNode {
           [sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->GetModule(); });
     } else if (name == "build") {
       return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
-        ICHECK_EQ(args.num_args, 5);
-        this->Build(args[0], args[1], args[2], args[3], args[4]);
+        ICHECK_EQ(args.num_args, 4);
+        this->Build(args[0], args[1], args[2], args[3]);
       });
     } else if (name == "list_params") {
       return PackedFunc(
@@ -277,23 +278,16 @@ class RelayBuildModule : public runtime::ModuleNode {
    * \param target Target device
    * \param target_host Host target device
    */
-  void Build(IRModule mod, const TargetMap& targets, const tvm::Target& target_host,
-             const String executor, const String mod_name) {
-    for (const auto& pair : targets) {
-      VLOG(0) << "Build target " << pair.first << " = " << pair.second->str();
-    }
-    if (target_host.defined()) {
-      VLOG(0) << "Build target_host = " << target_host->str();
-    }
-    VLOG(0) << "Build executor = '" << executor << "'";
-    VLOG(0) << "Build mod_name = '" << mod_name << "'";
-
+  void Build(IRModule mod, const TargetsMap& targets, const tvm::Target& target_host,
+             const String executor) {
     // Create protected variable targets_ from ground up
     targets_ = targets;
     target_host_ = target_host;
     executor_ = executor;
     CheckAndUpdateHostConsistency(&targets_, &target_host_);
-    BuildRelay(mod, params_, mod_name);
+    BuildRelay(mod, params_);
+    // Clear compile engine so that tuning schedules can be changed between runs. See issue #6096.
+    CompileEngine::Global()->Clear();
   }
 
  protected:
@@ -306,15 +300,8 @@ class RelayBuildModule : public runtime::ModuleNode {
    *
    * \return relay::IRModule The updated Relay IR module after optimization.
    */
-  IRModule Optimize(IRModule relay_module, const TargetMap& targets,
+  IRModule Optimize(IRModule relay_module, const TargetsMap& targets,
                     const std::unordered_map<std::string, runtime::NDArray>& params) {
-    targets_ = targets;
-    // No target_host setup it seems.
-    return OptimizeImpl(relay_module, params);
-  }
-
-  IRModule OptimizeImpl(IRModule relay_module,
-                        const std::unordered_map<std::string, runtime::NDArray>& params) {
     ICHECK(relay_module.defined()) << "The IRModule must be defined for the Relay compiler.";
 
     if (params.size()) {
@@ -326,66 +313,84 @@ class RelayBuildModule : public runtime::ModuleNode {
       relay_module_ptr->Update(main_glb_var, new_main);
     }
 
-    Array<Pass> pass_seqs = GetPassPrefix(targets_, false);
-    transform::PassContext pass_ctx = PassContext::Current();
+    Array<Pass> pass_seqs;
+    Array<runtime::String> entry_functions{"main"};
+    pass_seqs.push_back(transform::RemoveUnusedFunctions(entry_functions));
+    pass_seqs.push_back(transform::ToBasicBlockNormalForm());
 
-    // TODO(mbs): Centralize this logic and reconcile with similar in relay/backend/vm/compiler.cc
-    DLDeviceType default_device_type;
-    if (targets_.size() == 1) {
-      // Homogenous execution.
-      default_device_type = static_cast<DLDeviceType>((*targets_.begin()).first->value);
-      const auto& target = (*targets_.begin()).second;
+    // Run all dialect legalization passes.
+    pass_seqs.push_back(relay::qnn::transform::Legalize());
 
-      // This pass currently only supports the homogeneous case.
-      pass_seqs.push_back(
-          transform::SplitArgs(target->GetAttr<Integer>("max_function_args", -1).value()));
-    } else {
-      // Heterogeneous execution.
-      Optional<Integer> opt_fallback_dev =
-          pass_ctx->GetConfig<Integer>("relay.fallback_device_type");
-      if (opt_fallback_dev) {
-        default_device_type = static_cast<DLDeviceType>(opt_fallback_dev.value()->value);
-        Integer integer(static_cast<int>(default_device_type));
-        CHECK_GT(default_device_type, 0U)
-            << "The 'relay.fallback_device_type' is set to an invalid device type.";
-        if (targets_.count(integer) == 0) {
-          LOG(WARNING)
-              << "The 'relay.fallback_device_type' has been set to " << default_device_type
-              << " however no target has been given for that device type in the targets map. "
-                 "Creating an appropriate default target.";
-          targets_.Set(integer, CreateDefaultTarget(default_device_type));
-        }
-      } else {
-        default_device_type = kDLCPU;
-        Integer integer(static_cast<int>(default_device_type));
-        if (targets_.count(integer) == 0) {
-          LOG(WARNING) << "Using the default device type of kDLCPU, however no target has been "
-                          "given for that device type in the targets map. Creating an appropriate "
-                          "default target.";
-          targets_.Set(integer, CreateDefaultTarget(default_device_type));
-        }
-      }
+    // Legalize pass is restricted to homogeneous execution for now.
+    if (targets.size() == 1) {
+      pass_seqs.push_back(transform::Legalize());
     }
 
-    // Always plan devices so the remaining passes don't need to distinguish homogeneous vs
-    // hetrogenous execution.
-    pass_seqs.push_back(transform::PlanDevices(default_device_type));
+    pass_seqs.push_back(transform::SimplifyInference());
 
-    // Fuse the operations if it is needed.
-    pass_seqs.push_back(transform::FuseOps());
+    // Convert Dynamic ops to static versions
+    pass_seqs.push_back(transform::DynamicToStatic());
+
+    PackedFunc fskip = PackedFunc([](TVMArgs args, TVMRetValue* rv) {
+      Expr expr = args[0];
+      *rv = false;
+      if (expr.as<CallNode>()) {
+        auto call_node = expr.as<CallNode>();
+        auto op_node = call_node->op.as<OpNode>();
+        if (op_node->name == "cast") {
+          auto attrs = call_node->attrs.as<CastAttrs>();
+          if (attrs->dtype == DataType::Int(32)) {
+            *rv = true;
+          }
+        }
+      }
+    });
+    pass_seqs.push_back(transform::EliminateCommonSubexpr(fskip));
+    pass_seqs.push_back(transform::SimplifyExpr());
+    pass_seqs.push_back(transform::CombineParallelConv2D(3));
+    pass_seqs.push_back(transform::CombineParallelDense(3));
+    pass_seqs.push_back(transform::CombineParallelBatchMatmul(3));
+    pass_seqs.push_back(transform::FoldConstant());
+    pass_seqs.push_back(transform::FoldScaleAxis());
+    pass_seqs.push_back(transform::CanonicalizeCast());
+    pass_seqs.push_back(transform::CanonicalizeOps());
+
+    // Alter layout transformation is only applied to homogeneous execution yet.
+    if (targets.size() == 1) {
+      pass_seqs.push_back(transform::InferType());
+      pass_seqs.push_back(transform::AlterOpLayout());
+    }
+
+    // Fast math optimizations.
+    pass_seqs.push_back(transform::FastMath());
+    pass_seqs.push_back(transform::FoldConstant());
 
     // Create a sequential pass and perform optimizations.
     transform::Pass seq = transform::Sequential(pass_seqs);
-    if (targets_.size() == 1) {
-      With<Target> tctx((*targets_.begin()).second);
+    if (targets.size() == 1) {
+      const auto& it = targets.begin();
+      With<Target> tctx((*it).second);
       relay_module = seq(relay_module);
     } else {
       relay_module = seq(relay_module);
     }
 
+    // Handle heterogeneous compilation.
+    transform::PassContext pass_ctx = PassContext::Current();
+    if (targets_.size() > 1) {
+      Optional<Integer> opt_fallback_dev =
+          pass_ctx->GetConfig("relay.fallback_device_type", Integer(static_cast<int>(kDLCPU)));
+      auto fallback_dev = opt_fallback_dev.value();
+      ICHECK_GT(fallback_dev->value, 0U);
+      relay_module = RunDeviceAnnotationPass(relay_module, fallback_dev->value);
+    }
+
+    // Fuse the operations if it is needed.
+    relay_module = transform::FuseOps()(relay_module);
+
     // Do layout rewrite for auto-scheduler.
-    if (backend::IsAutoSchedulerEnabled() && targets_.size() == 1) {
-      const auto& target = (*targets_.begin()).second;
+    if (backend::IsAutoSchedulerEnabled() && targets.size() == 1) {
+      const auto& target = (*targets.begin()).second;
       Pass major_pass = transform::AutoSchedulerLayoutRewrite();
       bool enable_layout_rewrite_targets =
           target->kind->device_type == kDLCPU || target->GetAttr<String>("device", "") == "mali";
@@ -417,15 +422,83 @@ class RelayBuildModule : public runtime::ModuleNode {
   }
 
   /*!
-   * \brief Returns a default target to represent \p device_type.
+   * \brief Create a default type.
+   * \param device_type The device type index.
+   * \return the default target for the device.
    */
-  static Target CreateDefaultTarget(DLDeviceType device_type) {
+  Target CreateDefaultTarget(int device_type) {
     std::string name = runtime::DeviceName(device_type);
-    if (name == "cpu") {
-      return Target("llvm");
-    } else {
-      return Target(name);
+    if (name == "cpu") return Target("llvm");
+    if (name == "cuda") return Target("cuda");
+    return Target(name);
+  }
+
+  /*!
+   * \brief Update the target and fallback device required for heterogeneous
+   * compilation. CPU is used as the fallback device if it wasn't provided.
+   * Meanwhile, a CPU device type and "llvm" pair will be added to the target
+   * dictionary in this case.
+   *
+   * \param fallback_device The fallback device for heterogeneous execution.
+   */
+  void UpdateHeterogeneousInputs(int fallback_device) {
+    std::unordered_map<int64_t, tvm::Target> tmp_map;
+    for (const auto& kv : targets_) {
+      tmp_map[kv.first->value] = kv.second;
     }
+    if (tmp_map.count(fallback_device) == 0) {
+      targets_.Set(fallback_device, CreateDefaultTarget(fallback_device));
+    }
+  }
+
+  /*!
+   * \brief Execute the device annotation passes to update the input program and
+   *        target information.
+   *
+   * \param relay_module The input Relay module.
+   * \param fallback_device The fallback device for heterogeneous execution.
+   *
+   * \return updated_module The updated module after device annotation.
+   */
+  IRModule RunDeviceAnnotationPass(const IRModule& relay_module, int fallback_device) {
+    UpdateHeterogeneousInputs(fallback_device);
+    auto rewrite = transform::RewriteAnnotatedOps(fallback_device);
+    auto updated_module = rewrite(relay_module);
+    ICHECK(updated_module.defined());
+
+    tvm::Map<Expr, Integer> device_map;
+    for (const auto& it : updated_module->functions) {
+      device_map = relay::CollectDeviceInfo(it.second);
+      if (!device_map.empty()) break;
+    }
+
+    if (device_map.empty()) {
+      tvm::Map<Expr, Integer> annotation_map;
+      for (const auto& it : relay_module->functions) {
+        annotation_map = relay::CollectDeviceAnnotationOps(it.second);
+        if (!annotation_map.empty()) break;
+      }
+      // None op is annotated but they are fallen back to the default device.
+      if (annotation_map.empty()) {
+        targets_.Set(0, CreateDefaultTarget(fallback_device));
+      } else {
+        // All ops are annotated to the same device type.
+        int64_t dev_type = -1;
+        for (auto kv : annotation_map) {
+          dev_type = kv.second->value;
+          break;
+        }
+        for (auto kv : annotation_map) {
+          ICHECK_EQ(kv.second->value, dev_type) << "Expressions in the function are "
+                                                << "annotated with various device types,"
+                                                << "but not device copy operators "
+                                                << "found. Please check the "
+                                                << "RewriteAnnotation pass.";
+        }
+        targets_.Set(0, CreateDefaultTarget(dev_type));
+      }
+    }
+    return updated_module;
   }
 
   /*!
@@ -435,19 +508,18 @@ class RelayBuildModule : public runtime::ModuleNode {
    * \param params The parameters.
    */
   void BuildRelay(IRModule relay_module,
-                  const std::unordered_map<std::string, tvm::runtime::NDArray>& params,
-                  const String mod_name) {
+                  const std::unordered_map<std::string, tvm::runtime::NDArray>& params) {
     Target target_host = GetTargetHost();
     // If no target_host has been set, we choose a default one, which is
     // llvm if "codegen.LLVMModuleCreate" is accessible.
     const runtime::PackedFunc* pf = runtime::Registry::Get("codegen.LLVMModuleCreate");
     if (!target_host.defined()) target_host = (pf != nullptr) ? Target("llvm") : Target("stackvm");
 
-    // Update all the targets in the targets_ TargetMap
+    // Update all the targets in the targets_ TargetsMap
     CheckAndUpdateHostConsistency(&targets_, &target_host);
 
     // Relay IRModule -> IRModule optimizations.
-    relay_module = OptimizeImpl(relay_module, params);
+    relay_module = Optimize(relay_module, targets_, params);
 
     // Get the updated function.
     auto func = Downcast<Function>(relay_module->Lookup("main"));
@@ -455,17 +527,11 @@ class RelayBuildModule : public runtime::ModuleNode {
     // Generate code for the updated function.
     executor_codegen_ = MakeExecutorCodegen(executor_);
     executor_codegen_->Init(nullptr, targets_);
-    executor_codegen_->Codegen(func, mod_name);
+    executor_codegen_->Codegen(func);
     executor_codegen_->UpdateOutput(&ret_);
     ret_.params = executor_codegen_->GetParams();
 
     auto lowered_funcs = executor_codegen_->GetIRModule();
-
-    // No need to build for external functions.
-    Target ext_dev("ext_dev");
-    if (lowered_funcs.find(ext_dev) != lowered_funcs.end()) {
-      lowered_funcs.Set(ext_dev, IRModule());
-    }
 
     // Generate a placeholder function that attaches linked params as its arguments.
     if (target_host->GetAttr<Bool>("link-params").value_or(Bool(false))) {
@@ -482,11 +548,11 @@ class RelayBuildModule : public runtime::ModuleNode {
       DictAttrs attrs{dict};
       auto prim = tir::PrimFunc(Array<tir::Var>(), tir::SeqStmt(Array<tir::Stmt>()), VoidType(),
                                 Map<tir::Var, tir::Buffer>(), attrs);
-      if (lowered_funcs.find(target_host) == lowered_funcs.end()) {
-        lowered_funcs.Set(target_host, IRModule(Map<GlobalVar, BaseFunc>({})));
+      if (lowered_funcs.find(target_host->str()) == lowered_funcs.end()) {
+        lowered_funcs.Set(target_host->str(), IRModule(Map<GlobalVar, BaseFunc>({})));
       }
-      lowered_funcs[target_host]->Add(GlobalVar(::tvm::runtime::symbol::tvm_lookup_linked_param),
-                                      prim);
+      lowered_funcs[target_host->str()]->Add(
+          GlobalVar(::tvm::runtime::symbol::tvm_lookup_linked_param), prim);
     }
 
     // When there is no lowered_funcs due to reasons such as optimization.
@@ -501,7 +567,7 @@ class RelayBuildModule : public runtime::ModuleNode {
         ret_.mod = tvm::codegen::CSourceModuleCreate(";", "", Array<String>{});
       }
     } else {
-      ret_.mod = tvm::build(lowered_funcs, target_host);
+      ret_.mod = tvm::build(lowered_funcs, target_host_);
     }
 
     auto ext_mods = executor_codegen_->GetExternalModules();
@@ -539,7 +605,7 @@ class RelayBuildModule : public runtime::ModuleNode {
  protected:
   std::unique_ptr<ExecutorCodegen> executor_codegen_;
   /*! \brief target device */
-  TargetMap targets_;
+  TargetsMap targets_;
   /*! \brief target host device */
   tvm::Target target_host_;
   /*! \brief parameters */

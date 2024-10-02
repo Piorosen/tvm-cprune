@@ -61,17 +61,18 @@ bool ROIAlignRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
 }
 
 template <typename T>
-InferCorrectLayoutOutput ROIAlignInferCorrectLayout(const Attrs& attrs,
-                                                    const Array<Layout>& new_in_layouts,
-                                                    const Array<Layout>& old_in_layouts,
-                                                    const Array<tvm::relay::Type>& old_in_types) {
-  const T* params = attrs.as<T>();
+Array<Array<Layout> > ROIAlignInferCorrectLayout(const Attrs& attrs,
+                                                 const Array<Layout>& new_in_layouts,
+                                                 const Array<Layout>& old_in_layouts,
+                                                 const Array<tvm::relay::Type>& old_in_types) {
+  // NOTE: Discard "const" qualifier here.
+  T* params = const_cast<T*>(attrs.as<T>());
   Layout data_layout = params->layout;
 
   // Layout inference needs to define the layout for all inputs and output data layouts.
   // For roi_align, the second inputs is 2-D tensor with shape [num_roi, 5].
   // So, we set the layout as "N5".
-  return InferCorrectLayoutOutput({data_layout, Layout("N5")}, {data_layout}, attrs);
+  return Array<Array<Layout> >{{data_layout, Layout("N5")}, {data_layout}};
 }
 
 Expr MakeROIAlign(Expr data, Expr rois, Array<IndexExpr> pooled_size, double spatial_scale,
@@ -134,17 +135,18 @@ bool ROIPoolRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
 }
 
 template <typename T>
-InferCorrectLayoutOutput ROIPoolInferCorrectLayout(const Attrs& attrs,
-                                                   const Array<Layout>& new_in_layouts,
-                                                   const Array<Layout>& old_in_layouts,
-                                                   const Array<tvm::relay::Type>& old_in_types) {
-  const T* params = attrs.as<T>();
+Array<Array<Layout> > ROIPoolInferCorrectLayout(const Attrs& attrs,
+                                                const Array<Layout>& new_in_layouts,
+                                                const Array<Layout>& old_in_layouts,
+                                                const Array<tvm::relay::Type>& old_in_types) {
+  // NOTE: Discard "const" qualifier here.
+  T* params = const_cast<T*>(attrs.as<T>());
   Layout data_layout = params->layout;
 
   // Layout inference needs to define the layout for all inputs and output data layouts.
   // For roi_pool, the second inputs is 2-D tensor with shape [num_roi, 5].
   // So, we set the layout as "N5".
-  return InferCorrectLayoutOutput({data_layout, Layout("N5")}, {data_layout}, attrs);
+  return Array<Array<Layout> >{{data_layout, Layout("N5")}, {data_layout}};
 }
 
 Expr MakeROIPool(Expr data, Expr rois, Array<IndexExpr> pooled_size, double spatial_scale,

@@ -181,15 +181,12 @@ def fast_softmax_strategy(attrs, inputs, out_type, target):
     return strategy
 
 
-@override_native_generic_func("log_softmax_strategy")
-def log_softmax_strategy(attrs, inputs, out_type, target):
-    strategy = _op.OpStrategy()
-    strategy.add_implementation(
-        wrap_compute_softmax(topi.nn.log_softmax),
-        wrap_topi_schedule(topi.generic.schedule_softmax),
-        name="log_softmax.generic",
-    )
-    return strategy
+# log_softmax
+@generic_func
+def schedule_log_softmax(attrs, outs, target):
+    """Schedule log_softmax op"""
+    with target:
+        return topi.generic.schedule_softmax(outs)
 
 
 # lrn
@@ -446,7 +443,7 @@ def deformable_conv2d_strategy(attrs, inputs, out_type, target):
 
 
 # conv2d_transpose
-def wrap_compute_conv2d_transpose(topi_compute, has_groups=False):
+def wrap_compute_conv2d_transpose(topi_compute):
     """wrap conv2d_transpose topi compute"""
 
     def compute_conv2d_transpose(attrs, inputs, out_dtype):
@@ -456,11 +453,7 @@ def wrap_compute_conv2d_transpose(topi_compute, has_groups=False):
         out_dtype = attrs.out_dtype
         out_dtype = inputs[0].dtype if out_dtype in ("same", "") else out_dtype
         output_padding = get_const_tuple(attrs.output_padding)
-        # out = topi_compute(inputs[0], inputs[1], strides, padding, out_dtype, output_padding)
-        args = [inputs[0], inputs[1], strides, padding, out_dtype, output_padding]
-        if has_groups:
-            args.append(attrs.groups)
-        out = topi_compute(*args)
+        out = topi_compute(inputs[0], inputs[1], strides, padding, out_dtype, output_padding)
         return [out]
 
     return compute_conv2d_transpose
@@ -475,19 +468,13 @@ def conv2d_transpose_strategy(attrs, inputs, out_type, target):
     groups = attrs.groups
     assert layout == "NCHW", "only support nchw for now"
     assert dilation == (1, 1), "not support dilate now"
+    assert groups == 1, "only support groups == 1 for now"
     strategy = _op.OpStrategy()
-    if groups == 1:
-        strategy.add_implementation(
-            wrap_compute_conv2d_transpose(topi.nn.conv2d_transpose_nchw),
-            wrap_topi_schedule(topi.generic.schedule_conv2d_transpose_nchw),
-            name="conv2d_transpose_nchw.generic",
-        )
-    else:  # group_transpose_conv2d
-        strategy.add_implementation(
-            wrap_compute_conv2d_transpose(topi.nn.group_conv2d_transpose_nchw, has_groups=True),
-            wrap_topi_schedule(topi.generic.schedule_group_conv2d_transpose_nchw),
-            name="group_conv2d_transpose_nchw.generic",
-        )
+    strategy.add_implementation(
+        wrap_compute_conv2d_transpose(topi.nn.conv2d_transpose_nchw),
+        wrap_topi_schedule(topi.generic.schedule_conv2d_transpose_nchw),
+        name="conv2d_transpose_nchw.generic",
+    )
     return strategy
 
 
@@ -725,56 +712,6 @@ def dilation2d_strategy(attrs, inputs, out_type, target):
     return strategy
 
 
-def copy_if_identical(tensor_a, tensor_b):
-    """
-    When two inputs to batch_matul or dense are the same tensor, e.g. batch_matmul(x, x),
-    compilation fails because TE thinks there is only one input tensor x, and doing
-    cache_read(x) on the same tensor twice results in an error.
-    To prevent such errors, we make the second tensor be the copy of the first one
-    when two input tensors are identical.
-    """
-    if tensor_a == tensor_b:
-        return te.compute(tensor_a.shape, lambda *ind: tensor_a[ind])
-    return tensor_b
-
-
-# matmul
-def wrap_compute_matmul(topi_compute, need_auto_scheduler_layout=False):
-    """wrap matmul topi compute"""
-
-    def _compute_matmul(attrs, inputs, out_type):
-        """Compute definition of matmul"""
-        out_dtype = attrs.out_dtype
-        out_dtype = inputs[0].dtype if out_dtype == "" else out_dtype
-        args = [
-            inputs[0],
-            inputs[1],
-            None,
-            out_dtype,
-            attrs.transpose_a,
-            attrs.transpose_b,
-        ]
-        if need_auto_scheduler_layout:
-            args.append(get_auto_scheduler_rewritten_layout(attrs))
-        args[1] = copy_if_identical(inputs[0], inputs[1])
-        return [topi_compute(*args)]
-
-    return _compute_matmul
-
-
-@override_native_generic_func("matmul_strategy")
-def matmul_strategy(attrs, inputs, out_type, target):
-    """matmul generic strategy"""
-    logger.warning("matmul is not optimized for this platform.")
-    strategy = _op.OpStrategy()
-    strategy.add_implementation(
-        wrap_compute_matmul(topi.nn.matmul),
-        wrap_topi_schedule(topi.generic.schedule_matmul),
-        name="matmul.generic",
-    )
-    return strategy
-
-
 # dense
 def wrap_compute_dense(topi_compute, need_auto_scheduler_layout=False):
     """wrap dense topi compute"""
@@ -786,7 +723,6 @@ def wrap_compute_dense(topi_compute, need_auto_scheduler_layout=False):
         args = [inputs[0], inputs[1], None, out_dtype]
         if need_auto_scheduler_layout:
             args.append(get_auto_scheduler_rewritten_layout(attrs))
-        args[1] = copy_if_identical(inputs[0], inputs[1])
         return [topi_compute(*args)]
 
     return _compute_dense
@@ -824,12 +760,10 @@ def wrap_compute_batch_matmul(topi_compute, need_auto_scheduler_layout=False, ne
 
     def _compute_batch_matmul(attrs, inputs, out_type):
         args = [inputs[0], inputs[1], out_type.shape]
-        args.append(out_type.dtype if need_out_dtype else None)
-        args.append(attrs.transpose_a)
-        args.append(attrs.transpose_b)
         if need_auto_scheduler_layout:
             args.append(get_auto_scheduler_rewritten_layout(attrs))
-        args[1] = copy_if_identical(inputs[0], inputs[1])
+        if need_out_dtype:
+            args.append(out_type.dtype)
         return [topi_compute(*args)]
 
     return _compute_batch_matmul
@@ -1012,31 +946,6 @@ def topk_strategy(attrs, inputs, out_type, target):
     return strategy
 
 
-# searchsorted
-def wrap_compute_searchsorted(topi_compute):
-    """Wrap searchsorted compute"""
-
-    def _compute_searchsorted(attrs, inputs, out_type):
-        right = attrs.right
-        dtype = attrs.dtype
-        return [topi_compute(inputs[0], inputs[1], right, dtype)]
-
-    return _compute_searchsorted
-
-
-# searchsorted_strategy
-@override_native_generic_func("searchsorted_strategy")
-def searchsorted_strategy(attrs, inputs, out_type, target):
-    """searchsorted generic strategy"""
-    strategy = _op.OpStrategy()
-    strategy.add_implementation(
-        wrap_compute_searchsorted(topi.searchsorted),
-        wrap_topi_schedule(topi.generic.schedule_extern),
-        name="searchsorted.generic",
-    )
-    return strategy
-
-
 # multibox_prior
 def wrap_compute_multibox_prior(topi_compute):
     """Wrap multibox_prior compute"""
@@ -1186,15 +1095,7 @@ def wrap_compute_all_class_nms(topi_compute):
         max_output_size = inputs[2]
         iou_threshold = inputs[3]
         score_threshold = inputs[4]
-        output_format = attrs.output_format
-        return topi_compute(
-            inputs[0],
-            inputs[1],
-            max_output_size,
-            iou_threshold,
-            score_threshold,
-            output_format,
-        )
+        return topi_compute(inputs[0], inputs[1], max_output_size, iou_threshold, score_threshold)
 
     return _compute_nms
 
@@ -1698,46 +1599,3 @@ def schedule_transpose(attrs, outs, target):
     """schedule transpose"""
     with target:
         return schedule_injective(attrs, outs, target)
-
-
-# invert_permutation
-def wrap_compute_invert_permutation(topi_compute):
-    """wrap invert_permutation topi compute"""
-
-    def _compute_invert_permutation(attrs, inputs, out_type):
-        return [topi_compute(inputs[0])]
-
-    return _compute_invert_permutation
-
-
-@override_native_generic_func("invert_permutation_strategy")
-def invert_permutation_strategy(attrs, inputs, out_type, target):
-    """invert_permutation generic strategy"""
-    strategy = _op.OpStrategy()
-    strategy.add_implementation(
-        wrap_compute_invert_permutation(topi.invert_permutation),
-        wrap_topi_schedule(topi.generic.schedule_injective),
-        name="invert_permutation.generic",
-    )
-    return strategy
-
-
-def wrap_compute_einsum(topi_compute):
-    """Wrap einsum topi compute"""
-
-    def _compute_einsum(attrs, inputs, _):
-        return [topi_compute(attrs.equation, *inputs)]
-
-    return _compute_einsum
-
-
-@override_native_generic_func("einsum_strategy")
-def einsum_strategy(attrs, inputs, out_type, target):
-    """einsum generic strategy"""
-    strategy = _op.OpStrategy()
-    strategy.add_implementation(
-        wrap_compute_einsum(topi.einsum),
-        wrap_topi_schedule(topi.generic.schedule_einsum),
-        name="einsum.generic",
-    )
-    return strategy

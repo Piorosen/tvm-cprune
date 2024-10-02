@@ -20,7 +20,6 @@ from __future__ import absolute_import as _abs
 import tvm
 from tvm import te
 from tvm import topi
-from tvm.te import hybrid
 from . import cpp
 from . import tag
 from .utils import within_index, make_idx, const_vector
@@ -171,7 +170,7 @@ def reverse_sequence(a, seq_lengths, seq_axis=1, batch_axis=0):
     return cpp.reverse_sequence(a, seq_lengths, seq_axis, batch_axis)
 
 
-def strided_slice(a, begin, end, strides=None, axes=None, slice_mode="end"):
+def strided_slice(a, begin, end, strides=None, slice_mode="end"):
     """Slice of an array.
 
     Parameters
@@ -190,10 +189,6 @@ def strided_slice(a, begin, end, strides=None, axes=None, slice_mode="end"):
         in that case, the input tensor will be reversed
         in that particular axis.
 
-    axes : list of int, optional
-        Axes along which slicing is applied. When it is specified, begin, end
-        strides, and axes need to a list of integers of the same length.
-
     slice_mode : str, optional
         The slice mode [end, size].
         end - The ending indices for the slice [default].
@@ -210,7 +205,6 @@ def strided_slice(a, begin, end, strides=None, axes=None, slice_mode="end"):
         or isinstance(end, tvm.te.Tensor)
         or isinstance(strides, tvm.te.Tensor)
     ):
-        assert axes is None, "axes argument is not supported by dynamic strided slice yet."
         if not isinstance(begin, tvm.te.Tensor):
             begin = const_vector(begin)
         if not isinstance(end, tvm.te.Tensor):
@@ -222,9 +216,7 @@ def strided_slice(a, begin, end, strides=None, axes=None, slice_mode="end"):
         return cpp.dynamic_strided_slice(a, begin, end, strides)
     if strides is None:
         strides = []
-    if axes is None:
-        axes = []
-    return cpp.strided_slice(a, begin, end, strides, axes, slice_mode)
+    return cpp.strided_slice(a, begin, end, strides, slice_mode)
 
 
 @tvm.te.tag_scope(tag=tag.INJECTIVE + ",strided_set")
@@ -942,32 +934,3 @@ def adv_index(data, indices):
         Output tensor
     """
     return cpp.adv_index(data, indices)
-
-
-@hybrid.script
-def invert_permutation(data):
-    """Computes the inverse permutation of data.
-
-    Parameters
-    ----------
-    data : tvm.te.Tensor
-        Input data
-
-    Returns
-    -------
-    result : tvm.te.Tensor
-        Output tensor
-
-    Examples
-    --------
-    .. code-block:: python
-
-        data = [3, 4, 0, 2, 1]
-        topi.invert_permutation(data) = [2, 4, 3, 0, 1]
-    """
-    result = output_tensor(data.shape, data.dtype)
-    nums = data.shape[0]
-    for ind in range(nums):
-        r_ind = data[ind]
-        result[r_ind] = ind
-    return result

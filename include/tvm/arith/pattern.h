@@ -25,6 +25,7 @@
 #define TVM_ARITH_PATTERN_H_
 
 #include <tvm/ir/expr.h>
+#include <tvm/runtime/container.h>
 #include <tvm/tir/expr.h>
 
 namespace tvm {

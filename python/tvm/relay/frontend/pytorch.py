@@ -19,7 +19,6 @@
 # pylint: disable=import-outside-toplevel, simplifiable-if-expression, cell-var-from-loop, unnecessary-lambda
 # pylint: disable=missing-function-docstring
 """PT: PyTorch frontend."""
-import functools
 import itertools
 import logging
 import math
@@ -40,11 +39,10 @@ from ..loops import while_loop
 from ..prelude import Prelude, StaticTensorArrayOps
 from ..ty import Any, TensorType, TupleType
 from . import qnn_torch
-from .common import AttrCvt, get_relay_op, gru_cell
-from .common import infer_shape as _infer_shape
+from .common import AttrCvt, get_relay_op
 from .common import infer_value as _infer_value
 from .common import infer_value_simulated as _infer_value_simulated
-from .common import lstm_cell, try_infer_value, unbind
+from .common import try_infer_value
 from .pytorch_utils import is_version_greater_than
 
 __all__ = ["from_pytorch"]
@@ -393,10 +391,10 @@ class PyTorchOpConverter:
         stride = inputs[4]
 
         target_begin, is_begin_const = try_infer_value(
-            inputs[2], lambda ret: ret.astype(np.int).item(0)
+            inputs[2], lambda ret: np.asscalar(ret.astype(np.int))
         )
         target_end, is_end_const = try_infer_value(
-            inputs[3], lambda ret: ret.astype(np.int).item(0)
+            inputs[3], lambda ret: np.asscalar(ret.astype(np.int))
         )
 
         # A fast path when slicing is nop.
@@ -573,12 +571,6 @@ class PyTorchOpConverter:
         data = inputs[0]
         if isinstance(inputs[1], int):
             repeats = inputs[1]
-            axis = inputs[2]
-        elif isinstance(inputs[1], _expr.Expr):
-            if isinstance(inputs[1], _expr.Constant):
-                repeats = int(inputs[1].data.numpy())
-            else:
-                repeats, _ = try_infer_value(inputs[1], lambda ret: ret.tolist())
             axis = inputs[2]
         else:
             msg = "Only repeat with one value as repeat is currently supported."
@@ -762,13 +754,9 @@ class PyTorchOpConverter:
         return _op.nn.relu(data)
 
     def prelu(self, inputs, input_types):
-        # Reference: https://pytorch.org/docs/stable/generated/torch.nn.PReLU.html#torch.nn.PReLU
         data = inputs[0]
-        dim = self.get_dims(data)
-        ndims = len(dim)
-        axis = 0 if ndims == 1 else 1
-        alpha = _op.broadcast_to(inputs[1], (dim[axis]))
-        return _op.nn.prelu(data, alpha, axis)
+        alpha = inputs[1]
+        return _op.nn.prelu(data, alpha)
 
     def leaky_relu(self, inputs, input_types):
         data = inputs[0]
@@ -778,7 +766,7 @@ class PyTorchOpConverter:
     def elu(self, inputs, input_types):
         data = inputs[0]
         dtype = input_types[0]
-        alpha = _expr.const(-float(inputs[1]), dtype=dtype)
+        alpha = _expr.const(float(inputs[1]), dtype=dtype)
         return alpha * _op.nn.relu(_expr.const(1, dtype=dtype) - _op.exp(data)) + _op.nn.relu(data)
 
     def celu(self, inputs, input_types):
@@ -810,10 +798,6 @@ class PyTorchOpConverter:
         return gamma * (
             alpha * _op.nn.relu(_expr.const(1.0, dtype=dtype) - _op.exp(data)) + _op.nn.relu(data)
         )
-
-    def silu(self, inputs, input_types):
-        data = inputs[0]
-        return data * _op.tensor.sigmoid(data)
 
     def log_sigmoid(self, inputs, input_types):
         data = inputs[0]
@@ -849,23 +833,35 @@ class PyTorchOpConverter:
         data = inputs[0]
         return data * self.hard_sigmoid(inputs, input_types)
 
-    def adaptive_avg_pool(self, op, inputs, input_types):
+    def adaptive_avg_pool_2d(self, inputs, input_types):
         data = inputs[0]
         output_size = inputs[1]
 
         def func(x):
-            return op(x, output_size=output_size)
+            return _op.nn.adaptive_avg_pool2d(x, output_size=output_size)
 
         if self.is_quantized_tensor(data):
             return qnn_torch.apply_with_upcast(data, func)
 
         return func(data)
 
-    def adaptive_max_pool(self, op, inputs, input_types):
+    def adaptive_max_pool_2d(self, inputs, input_types):
+        data = inputs[0]
+        output_size = inputs[1]
+
+        # returns dummy indices too
+        return _op.nn.adaptive_max_pool2d(data, output_size=output_size), None
+
+    def adaptive_max_pool_3d(self, inputs, input_types):
         data = inputs[0]
         output_size = inputs[1]
         # returns dummy indices too
-        return op(data, output_size=output_size), None
+        return _op.nn.adaptive_max_pool3d(data, output_size=output_size), None
+
+    def adaptive_avg_pool_3d(self, inputs, input_types):
+        data = inputs[0]
+        output_size = inputs[1]
+        return _op.nn.adaptive_avg_pool3d(data, output_size=output_size)
 
     @staticmethod
     def convert_const_list(data):
@@ -1010,9 +1006,6 @@ class PyTorchOpConverter:
         elif len(kernel_size) == 2:
             data_layout = "NCHW"
             kernel_layout = "OIHW"
-            if use_transpose:
-                # Transposed convolutions have IOHW layout.
-                kernel_layout = "IOHW"
         else:
             data_layout = "NCW"
             kernel_layout = "OIW"
@@ -1309,7 +1302,7 @@ class PyTorchOpConverter:
         for i, shape in enumerate(shape_inp):
             if isinstance(shape, _expr.Expr):
                 val = _infer_value_simulated(shape, {})
-                new_shape[i] = val.numpy().item(0)
+                new_shape[i] = np.asscalar(val.numpy())
 
         return _op.transform.reshape(data, new_shape)
 
@@ -1447,20 +1440,11 @@ class PyTorchOpConverter:
         # 0 - input
         # 1 - weight
         bias = inputs[2]
-        a_shape = self.infer_shape_with_prelude(inputs[0])
-        b_shape = self.infer_shape_with_prelude(inputs[1])
-        if len(a_shape) == 2 and len(b_shape) == 2:
-            mm_out = _op.nn.dense(inputs[0], inputs[1])
-        elif len(b_shape) == 1:
-            mm_out = self.matmul([inputs[0], inputs[1]], input_types[:2])
-        else:
-            mm_out = self.matmul(
-                [inputs[0], _op.transpose(inputs[1], axes=(1, 0))], input_types[:2]
-            )
+        mm_out = self.matmul(inputs[:2], input_types[:2])
         if isinstance(bias, _expr.Expr):
             bias_ndims = len(self.infer_shape_with_prelude(bias))
             if bias_ndims == 1:
-                return _op.nn.bias_add(mm_out, bias, axis=-1)
+                return _op.nn.bias_add(mm_out, bias)
             mm_dtype = self.infer_type_with_prelude(mm_out).dtype
             return self.add([mm_out, bias], [mm_dtype, input_types[2]])
         return mm_out
@@ -1596,11 +1580,28 @@ class PyTorchOpConverter:
         else:
             unif_size = int(dim / num_chunks)
 
-        indeces = []
-        for i in range(unif_size, dim, unif_size):
-            indeces.append(i)
+        chunks = []
+        for i in range(0, dim, unif_size):
+            begin = [0] * len(shape)
+            end = shape[:]
+            begin[axis] = i
+            end[axis] = i + unif_size
+            stride = [1] * len(shape)
 
-        return _op.split(data, indeces, axis)
+            chunk_out = _op.transform.strided_slice(data, begin=begin, end=end, strides=stride)
+            chunks.append(chunk_out)
+
+        if dim % num_chunks:
+            begin = [0] * len(shape)
+            end = shape[:]
+            begin[axis] = unif_size * (num_chunks - 1)
+            end[axis] = dim
+            stride = [1] * len(shape)
+
+            chunk_out = _op.transform.strided_slice(data, begin=begin, end=end, strides=stride)
+            chunks.append(chunk_out)
+
+        return chunks
 
     def matmul(self, inputs, input_types):
 
@@ -1793,7 +1794,7 @@ class PyTorchOpConverter:
                 else:
                     out_size.append(size)
         else:
-            scale_index = 3 if method != "nearest_neighbor" else 2
+            scale_index = 3 if method in ["bilinear", "trilinear"] else 2
             scales = inputs[scale_index]
             assert scales is not None, "neither out size nor scale provided"
             assert isinstance(scales, list)
@@ -1808,7 +1809,7 @@ class PyTorchOpConverter:
             data = inputs[0]
             out_size = self.get_upsample_out_size(inputs, method)
 
-            if len(inputs) > 2 and method != "nearest_neighbor":
+            if len(inputs) > 2 and method == "bilinear":
                 align_corners = inputs[2]
             else:
                 align_corners = False
@@ -1821,9 +1822,7 @@ class PyTorchOpConverter:
                 coord_trans = "half_pixel"
 
             def func(x):
-                return _op.image.resize2d(
-                    x, out_size, "NCHW", method, coord_trans, cubic_alpha=-0.75
-                )
+                return _op.image.resize(x, out_size, "NCHW", method, coord_trans)
 
             if self.is_quantized_tensor(data):
                 # input qparams are manually appended by us
@@ -1842,7 +1841,7 @@ class PyTorchOpConverter:
             data = inputs[0]
             out_size = self.get_upsample_out_size(inputs, method)
 
-            if len(inputs) > 2 and method == "linear":
+            if len(inputs) > 2 and method == "trilinear":
                 align_corners = inputs[2]
             else:
                 align_corners = False
@@ -1873,6 +1872,9 @@ class PyTorchOpConverter:
     def Float(self, inputs, input_types):
         assert len(inputs) == 1
         return _op.cast(inputs[0], "float32")
+
+    def mm(self, inputs, input_types):
+        return _op.nn.dense(inputs[0], inputs[1])
 
     def bitwise_not(self, inputs, input_types):
         data = inputs[0]
@@ -2090,8 +2092,21 @@ class PyTorchOpConverter:
 
     def unbind(self, inputs, input_types):
         data = inputs[0]
-        axis = int(inputs[1])
-        return unbind(data, axis)
+        dim = int(inputs[1])
+        ishapes = self.infer_shape(data)
+        if dim >= len(ishapes):
+            msg = "Please check input dim, it shouldn't be greater than or equal to rank."
+            raise AttributeError(msg)
+
+        selections = ishapes[dim]
+        res_split = _op.split(data, selections, dim)
+        # squeeze each split piece to get same shape as aten::unbind
+        # TODO (yongwww): add new op to avoid the squeeze overhead
+        ret = []
+        for i in range(selections):
+            ret.append(_op.transform.squeeze(res_split[i], axis=[dim]))
+        ret = _expr.TupleWrapper(_expr.Tuple(ret), selections)
+        return ret
 
     def shape_as_tensor(self, inputs, input_types):
         is_symbolic_shape = False
@@ -2118,7 +2133,7 @@ class PyTorchOpConverter:
         data = inputs[0]
         ret = _op.transform.argwhere(data)
         if is_numpy_style or (len(inputs) > 1 and inputs[1]):
-            return unbind(ret, 1)
+            return self.unbind([ret, 1], None)
         return ret
 
     def nonzero_numpy(self, inputs, input_types):
@@ -2176,8 +2191,6 @@ class PyTorchOpConverter:
         method = inputs[3]
         if method.startswith("nearest"):
             method = "nearest_neighbor"
-        elif method[0:2] == "bi":
-            method = method[2:]
 
         if method == "nearest_neighbor":
             coord_trans = "asymmetric"
@@ -2186,7 +2199,7 @@ class PyTorchOpConverter:
         else:
             coord_trans = "half_pixel"
 
-        return _op.image.resize2d(data, out_size, "NCHW", method, coord_trans, cubic_alpha=-0.75)
+        return _op.image.resize(data, out_size, "NCHW", method, coord_trans)
 
     def numel(self, inputs, input_types):
         return _op.ndarray_size(inputs[0])
@@ -2294,530 +2307,6 @@ class PyTorchOpConverter:
             unique_sliced = _op.strided_slice(unique, begin=[0], end=num_uniq, slice_mode="size")
             return (unique_sliced, inverse_indices)
 
-    def nll_loss(self, inputs, input_types):
-        assert len(inputs) == 5
-        [predictions, targets, weights, reduction, ignore_index] = inputs
-        num_class = self.infer_shape(predictions)[1]
-        if reduction == 0:
-            reduction = "none"
-        elif reduction == 1:
-            reduction = "mean"
-        else:
-            reduction = "sum"
-        if weights is None:
-            weights = _op.full(_expr.const(1), (num_class,), dtype=input_types[0])
-        return _op.nn.nll_loss(predictions, targets, weights, reduction, ignore_index)
-
-    def flip(self, inputs, input_types):
-        data = inputs[0]
-        axis = inputs[1]
-        return _op.transform.reverse(data, axis=axis[0])
-
-    def bidir_gru_cell(
-        self,
-        input_seqs,
-        weights_dicts,
-    ):
-        """
-        Bidirectional GRU cell
-        """
-        seq_len = len(input_seqs)
-        forward_outputs, fw_H_t = gru_cell(
-            input_seqs,
-            **weights_dicts[0],
-        )
-
-        reverse_outputs, rev_H_t = gru_cell(
-            input_seqs,
-            **weights_dicts[1],
-            backwards=True,
-        )
-
-        final_outputs = []
-        for i in range(seq_len):
-            final_outputs.append(
-                _op.concatenate([forward_outputs[i], reverse_outputs[seq_len - 1 - i]], axis=-1)
-            )
-
-        return final_outputs, _op.stack([fw_H_t, rev_H_t], axis=0)
-
-    def gru_layers(self, input_data, layer_weights_dicts, bidirectional, dropout_p=0.0):
-        """
-        Methods iterates layers for Stacked GRU
-        """
-        layers_num = len(layer_weights_dicts)
-        # split input sequence to samples set
-        input_seqs = unbind(input_data, 0)  # [seq_num, (batch, feature_size)]
-        output_hiddens = []
-        for i in range(layers_num):
-            weights_dicts = layer_weights_dicts[i]
-            # input_seqs shape = [seq_num, (batch, feature_size)] or
-            # [seq_num, (batch, 2*feature_size)] for bidirectional
-            if bidirectional:
-                input_seqs, H_t = self.bidir_gru_cell(input_seqs, weights_dicts)
-            else:
-                input_seqs, H_t = gru_cell(input_seqs, **weights_dicts[0])
-
-            output_hiddens.append(H_t)
-
-            # TODO (vvchernov): in pytorch implementation train is also checked
-            # see https://github.com/pytorch/pytorch/blob/70c8daf43946b53af6493d058899ef952d27d339
-            # /aten/src/ATen/native/RNN.cpp#L1054
-            if dropout_p != 0 and i < layers_num - 1:
-                # for input in input_seqs:
-                #     input = _op.dropout(input, dropout_p)
-                raise NotImplementedError("Dropout for GRU has not been supported yet!")
-
-        return _op.stack(input_seqs, 0), _op.stack(output_hiddens, 0)
-
-    def gru(self, inputs, input_types):
-        """
-        Description of GRU in pytorch:
-        https://pytorch.org/docs/stable/generated/torch.nn.GRU.html?highlight=gru#torch.nn.GRU
-        """
-        # TODO (vvchernov): support dropout
-        assert len(inputs) == 9, "Input of size 9 is expected"
-        # Unpack inputs, note that if optional and not provided then value will be None.
-        _X = inputs[0]
-        # _X shape (seq_num, batch, feature_size) or (batch, seq_num, feature_size)
-
-        hidden_state = inputs[1]
-        # Hidden state shape (hidden_layers_num, batch, hidden_size)
-
-        _weights = inputs[2]
-        # Wi layer[0] shape (3 * hidden_size, feature_size)
-        # Wh layer[0] shape (3 * hidden_size, hidden_size)
-        # Bi layer[0] shape (3 * hidden_size)
-        # Bh layer[0] shape (3 * hidden_size)
-
-        # Wi layer[>0] shape (3 * hidden_size, hidden_size * num_directions)
-        # Wh layer[>0] shape (3 * hidden_size, hidden_size)
-        # Bi layer[>0] shape (3 * hidden_size)
-        # Bh layer[>0] shape (3 * hidden_size)
-
-        # Scalar inputs
-        has_biases = inputs[3]
-        num_layers = inputs[4]
-        dropout_p = inputs[5]  # dropout probability, if 0.0 it means there is no dropout
-        # train = inputs[6]
-        bidirectional = inputs[7]
-        batch_first = inputs[8]
-
-        num_directions = 1
-        if bidirectional:
-            num_directions = 2
-
-        rsd = len(_weights) % num_layers
-        assert rsd == 0, "The number of weights must be a multiple of the number of layers!"
-        rsd = (len(_weights) / num_layers) % num_directions
-        assert (
-            rsd == 0
-        ), "The number of weights in layer must be a multiple of the number of directions!"
-
-        weights_num = int(len(_weights) / num_layers / num_directions)
-        if has_biases:
-            assert weights_num == 4, "The weights number in layer is expected equal to 4"
-        else:
-            assert weights_num == 2, "The weights number in layer is expected equal to 2"
-
-        X = _op.transpose(_X, (1, 0, 2)) if batch_first else _X
-        # TODO (vvchernov): Which data type should be used? from input or weights?
-        # Instead of it _infer_type(X).checked_type.dtype can be used
-        X_dtype = input_types[0]
-        X_shape = _infer_shape(X)  # (seq_num, batch, feature_size)
-
-        hidden_size = int(_infer_shape(_weights[0])[0] / 3)
-        batch_size = X_shape[1]
-
-        # Initialize hidden states if not provided.
-        layers_h = []
-        hidden_layers_num = num_directions * num_layers
-        if hidden_state is None:
-            h_0 = _op.zeros((batch_size, hidden_size), X_dtype)
-            for i in range(hidden_layers_num):
-                layers_h.append(h_0)
-        else:
-            layers_h = unbind(hidden_state, 0)
-
-        layer_weights_dicts = []
-        k = 0  # layer counter
-        if has_biases:
-            names = ["hidden_state", "w_inp", "w_hid", "b_inp", "b_hid"]
-            if bidirectional:
-                rsd = len(_weights) % (2 * weights_num)
-                assert rsd == 0, "got an incorrect number of GRU weights"
-                for i in range(0, len(_weights), 2 * weights_num):
-                    fw_tensors = [layers_h[2 * k], *_weights[i : i + 4]]
-                    fw_weights_dict = dict(zip(names, fw_tensors))
-                    j = i + weights_num
-                    rev_tensors = [layers_h[2 * k + 1], *_weights[j : j + 4]]
-                    rev_weights_dict = dict(zip(names, rev_tensors))
-                    layer_weights_dicts.append([fw_weights_dict, rev_weights_dict])
-                    k += 1
-            else:
-                assert len(_weights) % weights_num == 0, "got an incorrect number of GRU weights"
-                for i in range(0, len(_weights), weights_num):
-                    fw_tensors = [layers_h[k], *_weights[i : i + 4]]
-                    fw_weights_dict = dict(zip(names, fw_tensors))
-                    layer_weights_dicts.append([fw_weights_dict])
-                    k += 1
-        else:
-            names = ["hidden_state", "w_inp", "w_hid"]
-            if bidirectional:
-                rsd = len(_weights) % (2 * weights_num)
-                assert rsd == 0, "got an incorrect number of GRU weights"
-                for i in range(0, len(_weights), 2 * weights_num):
-                    fw_tensors = [layers_h[2 * k], *_weights[i : i + 2]]
-                    fw_weights_dict = dict(zip(names, fw_tensors))
-                    j = i + weights_num
-                    rev_tensors = [layers_h[2 * k + 1], *_weights[j : j + 2]]
-                    rev_weights_dict = dict(zip(names, rev_tensors))
-                    layer_weights_dicts.append([fw_weights_dict, rev_weights_dict])
-                    k += 1
-            else:
-                assert len(_weights) % weights_num == 0, "got an incorrect number of GRU weights"
-                for i in range(0, len(_weights), weights_num):
-                    fw_tensors = [layers_h[k], *_weights[i : i + 2]]
-                    fw_weights_dict = dict(zip(names, fw_tensors))
-                    layer_weights_dicts.append([fw_weights_dict])
-                    k += 1
-        assert (
-            len(layer_weights_dicts) == num_layers and k == num_layers
-        ), "For stacked GRU number of weights sets should be the same as number of layers!"
-
-        output, out_hidden_state = self.gru_layers(
-            X,
-            layer_weights_dicts,
-            bidirectional,
-            dropout_p=dropout_p,
-        )
-
-        # output shape = (seq_num, batch, hidden_size) or
-        # (seq_num, batch, 2*feature_size) for bidirectional
-        if batch_first:
-            output = _op.transpose(output, (1, 0, 2))
-
-        return (output, out_hidden_state)
-
-    def bidir_lstm_cell(
-        self,
-        input_seqs,
-        weights_dicts,
-    ):
-        """
-        Bidirectional LSTM cell
-        """
-        seq_len = len(input_seqs)
-        forward_outputs, fw_H_t, fw_C_t = lstm_cell(
-            input_seqs,
-            **weights_dicts[0],
-        )
-
-        reverse_outputs, rev_H_t, rev_C_t = lstm_cell(
-            input_seqs,
-            **weights_dicts[1],
-            backwards=True,
-        )
-
-        final_outputs = []
-        for i in range(seq_len):
-            final_outputs.append(
-                _op.concatenate([forward_outputs[i], reverse_outputs[seq_len - 1 - i]], axis=-1)
-            )
-
-        return final_outputs, (fw_H_t, fw_C_t), (rev_H_t, rev_C_t)
-
-    def lstm_layers(self, input_data, layer_weights_dicts, bidirectional, dtype, dropout_p=0.0):
-        """
-        Methods iterates layers for Stacked LSTM
-        """
-        layers_num = len(layer_weights_dicts)
-        # split input sequence to samples set
-        input_seqs = unbind(input_data, 0)  # [seq_num, (batch, feature_size)]
-        output_hiddens = []
-        for i in range(layers_num):
-            weights_dicts = layer_weights_dicts[i]
-            # input_seqs shape = [seq_num, (batch, feature_size)] or
-            # [seq_num, (batch, 2*feature_size)] for bidirectional
-            if bidirectional:
-                input_seqs, H_t, C_t = self.bidir_lstm_cell(input_seqs, weights_dicts)
-            else:
-                input_seqs, H_t, C_t = lstm_cell(input_seqs, **weights_dicts[0])
-
-            output_hiddens.append((H_t, C_t))
-
-            # TODO (vvchernov): in pytorch implementation train is also checked
-            # see https://github.com/pytorch/pytorch/blob/70c8daf43946b53af6493d058899ef952d27d339
-            # /aten/src/ATen/native/RNN.cpp#L1054
-            if dropout_p != 0 and i < layers_num - 1:
-                # for input in input_seqs:
-                #     input = _op.dropout(input, dropout_p)
-                raise NotImplementedError("Dropout for LSTM has not been supported yet!")
-        final_hiddens = []
-        if bidirectional:
-            for output_hidden in output_hiddens:
-                final_hiddens.append(output_hidden[0])
-                final_hiddens.append(output_hidden[1])
-        else:
-            final_hiddens = output_hiddens
-
-        return _op.stack(input_seqs, 0), final_hiddens
-
-    def lstm(self, inputs, input_types):
-        """
-        Description of LSTM in pytorch:https://pytorch.org/docs/stable/generated/torch.nn.LSTM.html
-        Native implementation for torch version less than 1.8.0 (projection is unsupported):
-        https://github.com/pytorch/pytorch/blob/70c8daf43946b53af6493d058899ef952d27d339/aten/ \
-        src/ATen/native/RNN.cpp#L1396
-        Native implementation for torch version from 1.8.0 and higher (projection is supported):
-        https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/native/RNN.cpp#L1483
-        """
-        # TODO (vvchernov): support dropout
-        assert len(inputs) == 9, "Input of size 9 is expected"
-        # Unpack inputs, note that if optional and not provided then value will be None.
-        _X = inputs[0]
-        # _X shape (seq_num, batch, feature_size) or (batch, seq_num, feature_size)
-
-        hidden_states = inputs[1]
-        assert len(hidden_states) == 2, "lstm expects two hidden states"
-        h_0 = hidden_states[0]
-        c_0 = hidden_states[1]
-        # H0 shape (hidden_layers_num, batch, proj_size) if projection
-        # else (hidden_layers_num, batch, hidden_size)
-        # C0 shape (hidden_layers_num, batch, hidden_size)
-
-        _weights = inputs[2]
-        # If no projection
-        # Wi layer[0] shape (4 * hidden_size, feature_size)
-        # Wh layer[0] shape (4 * hidden_size, hidden_size)
-        # Bi layer[0] shape (4 * hidden_size)
-        # Bh layer[0] shape (4 * hidden_size)
-
-        # Wi layer[>0] shape (4 * hidden_size, hidden_size * num_directions)
-        # Wh layer[>0] shape (4 * hidden_size, hidden_size)
-        # Bi layer[>0] shape (4 * hidden_size)
-        # Bh layer[>0] shape (4 * hidden_size)
-
-        # If projection
-        # Wi layer[0] shape (4 * hidden_size, feature_size)
-        # Wh layer[0] shape (4 * hidden_size, proj_size)
-        # Bi layer[0] shape (4 * hidden_size)
-        # Bh layer[0] shape (4 * hidden_size)
-        # P  layer[0] shape (proj_size, hidden_size)
-
-        # Wi layer[>0] shape (4 * hidden_size, proj_size * num_directions)
-        # Wh layer[>0] shape (4 * hidden_size, proj_size)
-        # Bi layer[>0] shape (4 * hidden_size)
-        # Bh layer[>0] shape (4 * hidden_size)
-        # P  layer[>0] shape (proj_size, hidden_size)
-
-        # Scalar inputs
-        has_biases = inputs[3]
-        num_layers = inputs[4]
-        dropout_p = inputs[5]  # dropout probability, if 0.0 it means there is no dropout
-        # train = inputs[6]
-        bidirectional = inputs[7]
-        batch_first = inputs[8]
-
-        num_directions = 1
-        if bidirectional:
-            num_directions = 2
-
-        rsd = len(_weights) % num_layers
-        assert rsd == 0, "The number of weights must be a multiple of the number of layers!"
-        rsd = (len(_weights) / num_layers) % num_directions
-        assert (
-            rsd == 0
-        ), "The number of weights in layer must be a multiple of the number of directions!"
-        has_proj = False
-        proj_size = 0
-        weights_num = int(len(_weights) / num_layers / num_directions)
-        if has_biases:
-            if weights_num == 5:
-                has_proj = True
-                proj_size = _infer_shape(_weights[4])[0]
-            else:
-                assert weights_num == 4, "The weights number in layer is expected equal to 4"
-        else:
-            if weights_num == 3:
-                has_proj = True
-                proj_size = _infer_shape(_weights[2])[0]
-            else:
-                assert weights_num == 2, "The weights number in layer is expected equal to 2"
-
-        X = _op.transpose(_X, (1, 0, 2)) if batch_first else _X
-        # TODO (vvchernov): Which data type should be used? from input or weights?
-        # Instead of it _infer_type(X).checked_type.dtype can be used
-        X_dtype = input_types[0]
-        X_shape = _infer_shape(X)  # (seq_num, batch, feature_size)
-
-        hidden_size = _infer_shape(_weights[0])[0] / 4
-        batch_size = X_shape[1]
-
-        # Initialize hidden states if not provided.
-        layers_h = []
-        layers_c = []
-        hidden_layers_num = num_directions * num_layers
-        if h_0 is None:
-            if has_proj:
-                h_0 = _op.zeros((batch_size, proj_size), X_dtype)
-            else:
-                h_0 = _op.zeros((batch_size, hidden_size), X_dtype)
-            for i in range(hidden_layers_num):
-                layers_h.append(h_0)
-        else:
-            layers_h = unbind(h_0, 0)
-        if c_0 is None:
-            c_0 = _op.zeros((batch_size, hidden_size), X_dtype)
-            for i in range(hidden_layers_num):
-                layers_c.append(c_0)
-        else:
-            layers_c = unbind(c_0, 0)
-
-        layer_weights_dicts = []
-        k = 0  # layer counter
-        if has_biases:
-            names = ["hidden_state", "cell_state", "w_inp", "w_hid", "b_inp", "b_hid"]
-            if bidirectional:
-                rsd = len(_weights) % (2 * weights_num)
-                assert rsd == 0, "got an incorrect number of LSTM weights"
-                for i in range(0, len(_weights), 2 * weights_num):
-                    fw_tensors = [layers_h[2 * k], layers_c[2 * k], *_weights[i : i + 4]]
-                    fw_weights_dict = dict(zip(names, fw_tensors))
-                    if has_proj:
-                        fw_weights_dict["proj"] = _weights[i + 4]
-                    j = i + weights_num
-                    rev_tensors = [layers_h[2 * k + 1], layers_c[2 * k + 1], *_weights[j : j + 4]]
-                    rev_weights_dict = dict(zip(names, rev_tensors))
-                    if has_proj:
-                        rev_weights_dict["proj"] = _weights[j + 4]
-                    layer_weights_dicts.append([fw_weights_dict, rev_weights_dict])
-                    k += 1
-            else:
-                assert len(_weights) % weights_num == 0, "got an incorrect number of LSTM weights"
-                for i in range(0, len(_weights), weights_num):
-                    fw_tensors = [layers_h[k], layers_c[k], *_weights[i : i + 4]]
-                    fw_weights_dict = dict(zip(names, fw_tensors))
-                    if has_proj:
-                        fw_weights_dict["proj"] = _weights[i + 4]
-                    layer_weights_dicts.append([fw_weights_dict])
-                    k += 1
-        else:
-            names = ["hidden_state", "cell_state", "w_inp", "w_hid"]
-            if bidirectional:
-                rsd = len(_weights) % (2 * weights_num)
-                assert rsd == 0, "got an incorrect number of LSTM weights"
-                for i in range(0, len(_weights), 2 * weights_num):
-                    fw_tensors = [layers_h[2 * k], layers_c[2 * k], *_weights[i : i + 2]]
-                    fw_weights_dict = dict(zip(names, fw_tensors))
-                    if has_proj:
-                        fw_weights_dict["proj"] = _weights[i + 2]
-                    j = i + weights_num
-                    rev_tensors = [layers_h[2 * k + 1], layers_c[2 * k + 1], *_weights[j : j + 2]]
-                    rev_weights_dict = dict(zip(names, rev_tensors))
-                    if has_proj:
-                        rev_weights_dict["proj"] = _weights[j + 2]
-                    layer_weights_dicts.append([fw_weights_dict, rev_weights_dict])
-                    k += 1
-            else:
-                assert len(_weights) % weights_num == 0, "got an incorrect number of LSTM weights"
-                for i in range(0, len(_weights), weights_num):
-                    fw_tensors = [layers_h[k], layers_c[k], *_weights[i : i + 2]]
-                    fw_weights_dict = dict(zip(names, fw_tensors))
-                    if has_proj:
-                        fw_weights_dict["proj"] = _weights[i + 2]
-                    layer_weights_dicts.append([fw_weights_dict])
-                    k += 1
-        assert (
-            len(layer_weights_dicts) == num_layers and k == num_layers
-        ), "For stacked LSTM number of weights sets should be the same as number of layers!"
-
-        outputs = self.lstm_layers(
-            X,
-            layer_weights_dicts,
-            bidirectional,
-            dtype=X_dtype,
-            dropout_p=dropout_p,
-        )
-
-        # output shape = (seq_num, batch, hidden_size) or
-        # (seq_num, batch, 2*feature_size) for bidirectional
-        output = outputs[0]
-
-        hy = []
-        cy = []
-        for hidden in outputs[1]:
-            hy.append(hidden[0])
-            cy.append(hidden[1])
-
-        if batch_first:
-            output = _op.transpose(output, (1, 0, 2))
-
-        return (output, _op.stack(hy, 0), _op.stack(cy, 0))
-
-    def all_any_common(self, op, inputs, input_types):
-        dim = inputs[1]
-        keepdim = inputs[2]
-        if self.infer_type(inputs[0]).dtype != "bool":
-            # The input dtype can be uint8.
-            inp = _op.cast(inputs[0], "bool")
-        else:
-            inp = inputs[0]
-        return op(inp, axis=dim, keepdims=keepdim)
-
-    def searchsorted_common(self, sorted_sequence, values, out_int32, right):
-        dtype = "int32" if out_int32 else "int64"
-        values_shape = _infer_shape(values)
-
-        if len(values_shape) == 0:
-            values = _op.expand_dims(values, 0)
-
-        out = _op.searchsorted(sorted_sequence, values, right=right, dtype=dtype)
-
-        if len(values_shape) == 0:
-            return _op.squeeze(out)
-
-        return out
-
-    def searchsorted(self, inputs, input_types):
-        return self.searchsorted_common(*inputs)
-
-    def bucketize(self, inputs, input_types):
-        return self.searchsorted_common(inputs[1], inputs[0], inputs[2], inputs[3])
-
-    def roll(self, inputs, input_types):
-        def slide_axes(inp, shape, ax):
-            axes = list(range(len(shape)))
-            axes = axes[:ax] + [-1] + axes[ax:-1]
-            return _op.transpose(inp, axes)
-
-        x = inputs[0]
-        shifts = inputs[1]
-        dims = inputs[2]
-        shape = self.infer_shape(x)
-        start = _expr.const(0, "int64")
-        step = _expr.const(1, "int64")
-
-        out = x
-        for i, dim in enumerate(dims):
-            roll_dim = _expr.const(shape[dim], "int64")
-            indices_1d = _op.mod(
-                _op.transform.arange(start, roll_dim, step, "int64")
-                - _expr.const(shifts[i], "int64")
-                + roll_dim,
-                roll_dim,
-            )
-            # First fill in the last axis with roll indices, and then do transpose to
-            # bring the roll indices into the desired axis.
-            indices = slide_axes(
-                _op.tile(indices_1d, shape[:dim] + shape[dim + 1 :] + (1,)),
-                shape,
-                dim,
-            )
-            out = _op.gather(out, dim, indices)
-
-        return out
-
     # Operator mappings
     def create_convert_map(self):
         self.convert_map = {
@@ -2874,27 +2363,9 @@ class PyTorchOpConverter:
             "aten::celu": self.celu,
             "aten::gelu": self.gelu,
             "aten::selu": self.selu,
-            "aten::silu": self.silu,
-            "aten::silu_": self.silu,
             "aten::log_sigmoid": self.log_sigmoid,
-            "aten::adaptive_avg_pool1d": functools.partial(
-                self.adaptive_avg_pool, _op.nn.adaptive_avg_pool1d
-            ),
-            "aten::adaptive_avg_pool2d": functools.partial(
-                self.adaptive_avg_pool, _op.nn.adaptive_avg_pool2d
-            ),
-            "aten::adaptive_avg_pool3d": functools.partial(
-                self.adaptive_avg_pool, _op.nn.adaptive_avg_pool3d
-            ),
-            "aten::adaptive_max_pool1d": functools.partial(
-                self.adaptive_max_pool, _op.nn.adaptive_max_pool1d
-            ),
-            "aten::adaptive_max_pool2d": functools.partial(
-                self.adaptive_max_pool, _op.nn.adaptive_max_pool2d
-            ),
-            "aten::adaptive_max_pool3d": functools.partial(
-                self.adaptive_max_pool, _op.nn.adaptive_max_pool3d
-            ),
+            "aten::adaptive_avg_pool2d": self.adaptive_avg_pool_2d,
+            "aten::adaptive_max_pool2d": self.adaptive_max_pool_2d,
             "aten::max_pool2d": self.maxpool_2d,
             "aten::max_pool2d_with_indices": self.maxpool_2d_with_indices,
             "aten::max_pool1d": self.maxpool_1d,
@@ -2921,7 +2392,6 @@ class PyTorchOpConverter:
             "aten::clone": self.clone,
             "aten::log_softmax": self.log_softmax,
             "aten::sigmoid": self.sigmoid,
-            "aten::sigmoid_": self.sigmoid,
             "aten::softplus": self.softplus,
             "aten::avg_pool1d": self.make_avg_pool(1),
             "aten::avg_pool2d": self.make_avg_pool(2),
@@ -2933,7 +2403,6 @@ class PyTorchOpConverter:
             "aten::alpha_dropout": self.dropout,
             "aten::mean": self.mean,
             "aten::chunk": self.chunk,
-            "aten::unsafe_chunk": self.chunk,
             "aten::matmul": self.matmul,
             "aten::bmm": self.matmul,
             "aten::expand": self.expand,
@@ -2964,7 +2433,6 @@ class PyTorchOpConverter:
             "aten::sinh": self.make_unary("sinh"),
             "aten::tan": self.make_unary("tan"),
             "aten::tanh": self.make_unary("tanh"),
-            "aten::tanh_": self.make_unary("tanh"),
             "aten::acos": self.make_unary("acos"),
             "aten::asin": self.make_unary("asin"),
             "aten::atan": self.make_unary("atan"),
@@ -2980,7 +2448,6 @@ class PyTorchOpConverter:
             "aten::rsqrt": self.make_unary("rsqrt"),
             "aten::ceil": self.make_unary("ceil"),
             "aten::floor": self.make_unary("floor"),
-            "aten::floor_": self.make_unary("floor"),
             "aten::round": self.make_unary("round"),
             "aten::isfinite": self.make_unary("isfinite"),
             "aten::isinf": self.make_unary("isinf"),
@@ -2988,10 +2455,9 @@ class PyTorchOpConverter:
             "aten::clamp": self.clamp,
             "aten::clamp_": self.clamp,
             "aten::detach": self.identity,
-            "aten::upsample_bilinear2d": self.make_upsample("linear"),
-            "aten::upsample_bicubic2d": self.make_upsample("cubic"),
+            "aten::upsample_bilinear2d": self.make_upsample("bilinear"),
             "aten::upsample_nearest2d": self.make_upsample("nearest_neighbor"),
-            "aten::upsample_trilinear3d": self.make_upsample3d("linear"),
+            "aten::upsample_trilinear3d": self.make_upsample3d("trilinear"),
             "aten::upsample_nearest3d": self.make_upsample3d("nearest_neighbor"),
             "aten::expand_as": self.expand_as,
             "aten::lt": self.make_elemwise("less"),
@@ -3006,6 +2472,8 @@ class PyTorchOpConverter:
             "aten::bitwise_xor": self.bitwise_xor,
             "aten::Bool": self.Bool,
             "aten::Float": self.Float,
+            "aten::adaptive_avg_pool3d": self.adaptive_avg_pool_3d,
+            "aten::adaptive_max_pool3d": self.adaptive_max_pool_3d,
             "aten::rsub": self.rsub,
             "aten::embedding": self.embedding,
             "aten::one_hot": self.one_hot,
@@ -3047,21 +2515,10 @@ class PyTorchOpConverter:
             "aten::hardsigmoid": self.hard_sigmoid,
             "aten::cumsum": self.cumsum,
             "aten::masked_fill": self.masked_fill,
-            "aten::masked_fill_": self.masked_fill,
             "aten::masked_select": self.masked_select,
             "aten::argsort": self.argsort,
             "aten::sort": self.sort,
             "aten::_unique2": self.unique,
-            "aten::nll_loss": self.nll_loss,
-            "aten::nll_loss2d": self.nll_loss,
-            "aten::flip": self.flip,
-            "aten::gru": self.gru,
-            "aten::lstm": self.lstm,
-            "aten::all": functools.partial(self.all_any_common, _op.all),
-            "aten::any": functools.partial(self.all_any_common, _op.any),
-            "aten::searchsorted": self.searchsorted,
-            "aten::bucketize": self.bucketize,
-            "aten::roll": self.roll,
         }
 
     def update_convert_map(self, custom_map):
@@ -3476,8 +2933,8 @@ def _getattr_attr_name(node):
     return attr_name
 
 
-def _getattr_full_name(getattrs, sep="."):
-    return sep.join([_getattr_attr_name(node) for node in getattrs])
+def _getattr_full_name(getattrs):
+    return ".".join([_getattr_attr_name(node) for node in getattrs])
 
 
 def _get_pytorch_value_type(typ, default_dtype="float32"):
@@ -3733,7 +3190,7 @@ def get_attr_chains(root_getattr_node):
     return get_use_chains(root_getattr_node, terminate)
 
 
-def convert_params(graph, state_dict, use_parser_friendly_name=False):
+def convert_params(graph, state_dict):
     """
     Return Relay vars and TVM NDArrays for input parameters
     A chain of prim::GetAttr nodes is processed one at a time
@@ -3744,7 +3201,6 @@ def convert_params(graph, state_dict, use_parser_friendly_name=False):
     packed_param_map = {}
     vars_by_name = {}
     seen = set()
-    attr_name_sep = "_" if use_parser_friendly_name else "."
 
     for node in getattr_nodes:
         if _get_output_name(node) in seen:
@@ -3753,7 +3209,7 @@ def convert_params(graph, state_dict, use_parser_friendly_name=False):
         for getattrs in get_attr_chains(node):
             seen.update(map(_get_output_name, getattrs))
 
-            full_attr = _getattr_full_name(getattrs, attr_name_sep)
+            full_attr = _getattr_full_name(getattrs)
             full_attr_node_name = _get_output_name(getattrs[-1])
 
             if full_attr.endswith("_packed_params"):  # for quantized models
@@ -3783,14 +3239,7 @@ def get_all_op_names(graph):
     return set(node.kind() for node in nodes)
 
 
-def from_pytorch(
-    script_module,
-    input_infos,
-    custom_convert_map=None,
-    default_dtype="float32",
-    use_parser_friendly_name=False,
-    keep_quantized_weight=False,
-):
+def from_pytorch(script_module, input_infos, custom_convert_map=None, default_dtype="float32"):
     """Load PyTorch model in the form of a scripted PyTorch model and convert into relay.
     The companion parameters will be handled automatically.
 
@@ -3813,28 +3262,9 @@ def from_pytorch(
     custom_convert_map : Dictionary of str to Relay op
         A custom op conversion map in the same format as _convert_map above
 
-    default_type : str
-        The default dtype to use when type information is not provided by PyTorch.
-
-    use_parser_friendly_name : bool
-        When True, replace '.' with `_' in a original parameter name.
-        The Relay text parser treats a variable name followed by a period as a tuple element access,
-        so a variable name like "dense.weight" cannot be parsed correctly.
-        Use this option when you want to run the AnnotateSpans pass on the imported module.
-
-    keep_quantized_weight : bool
-        Return quantized weights and bias, rather than float ones. PyTorch stores quantized weights
-        in a custom format, so we cannot directly access 8 bit weights as Numpy arrays. We use
-        a PyTorch function to unpack quantized weights into float32 arrays and quantization
-        parameters. By default, we return float32 weights and rely on the QNN lowering and the
-        Relay constant folding pass to quantize weights at compile time. In BYOC use cases, however,
-        we cannot apply the constant folding pass on a QNN graph. If keep_quantized_weight is True,
-        we quantize weights in the frontend using a function that is equivalent to
-        qnn.op.quantize(...) operating on Numpy arrays.
-
     Returns
     -------
-    mod : tvm.IRModule
+    mod : tvm.relay.Module
         The module that optimizations will be performed on.
 
     params : dict of str to tvm.runtime.NDArray
@@ -3861,13 +3291,7 @@ def from_pytorch(
     outputs = _get_relay_input_vars(
         graph, input_infos, prelude, default_dtype=default_dtype, is_module=is_module
     )
-
-    if use_parser_friendly_name:
-        new_names = [key.replace(".", "_") for key in params.keys()]
-        params = dict(zip(new_names, params.values()))
-
-    param_vars, tensors, packed_param_map = convert_params(graph, params, use_parser_friendly_name)
-
+    param_vars, tensors, packed_param_map = convert_params(graph, params)
     tvm_params = {k: tvm.nd.array(v) for k, v in tensors.items()}
 
     outputs.update(param_vars)
@@ -3876,17 +3300,9 @@ def from_pytorch(
     # For quantized models
     quantized_ops = set(["aten::quantize_per_tensor", "quantized::linear_dynamic"])
     if len(quantized_ops.intersection(set(op_names))) > 0:
-        weight_quant_params = qnn_torch.get_weight_quant_params(
-            script_module, packed_param_map.values()
-        )
-        input_scales_for_bias = qnn_torch.add_input_quant_params_to_op_inputs(graph)
-        qnn_torch.add_quant_params_to_outputs(
-            outputs,
-            packed_param_map,
-            weight_quant_params,
-            input_scales_for_bias,
-            keep_quantized_weight,
-        )
+        weight_quant_params = qnn_torch.get_weight_quant_params(script_module)
+        qnn_torch.add_input_quant_params_to_op_inputs(graph)
+        qnn_torch.add_quant_params_to_outputs(outputs, packed_param_map, weight_quant_params)
         qnn_torch.add_quant_params(tvm_params, weight_quant_params)
         converter.update_convert_map(qnn_torch.convert_map)
 
@@ -3895,7 +3311,7 @@ def from_pytorch(
         # ListConstruct kept original python list. Convert to tuple.
         ret = _expr.Tuple(ret)
 
-    # Separate data inputs and parameters to make sure data inputs come first.
+    # Separate data inputs and parameters to make sure data inputs are always in the beginning.
     func_args = []
     data_inputs = []
     for arg in _analysis.free_vars(ret):

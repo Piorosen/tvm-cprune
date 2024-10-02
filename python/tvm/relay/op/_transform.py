@@ -178,11 +178,6 @@ def compute_unique(attrs, inputs, output_type):
 
 _reg.register_strategy("unique", strategy.unique_strategy)
 
-# invert_permutation
-_reg.register_strategy("invert_permutation", strategy.invert_permutation_strategy)
-_reg.register_shape_func("invert_permutation", False, elemwise_shape_func)
-
-
 #####################
 #  Shape functions  #
 #####################
@@ -249,67 +244,15 @@ def _strided_slice_shape_func_input_shape(data_shape, begin, end, strides, slice
     return out
 
 
-@script
-def _strided_slice_shape_func_with_axes(data_shape, begin, end, strides, slice_mode, axes):
-    ndim = data_shape.shape[0]
-    out = output_tensor((ndim,), "int64")
-    for i in const_range(ndim):
-        out[i] = data_shape[i]
-
-    for i in const_range(len(axes)):
-        cbegin = int64(0)
-        cend = int64(data_shape[axes[i]])
-        cstride = int64(1)
-        if len(strides) > i:
-            cstride = int64(strides[i])
-        if len(begin) > i:
-            cbegin = int64(begin[i])
-            if cbegin < 0:
-                cbegin += int64(data_shape[axes[i]])
-        if len(end) <= i:
-            cend = int64(data_shape[axes[i]])
-        elif slice_mode != 0:
-            cstride = int64(1)
-            if end[i] < 0:
-                cend = int64(data_shape[axes[i]])
-            else:
-                cend = cbegin + int64(end[i])
-        else:
-            if end[i] > data_shape[i]:
-                cend = int64(data_shape[axes[i]])
-            elif end[i] < -data_shape[i]:
-                cend = int64(-1)
-            else:
-                cend = int64(end[i])
-                if cend < 0:
-                    cend += int64(data_shape[axes[i]])
-        assert cstride != 0, "Strides can't be zero."
-        if cstride < 0:
-            slice_range = cbegin - cend
-            step = -cstride
-        else:
-            slice_range = cend - cbegin
-            step = cstride
-
-        out[axes[i]] = int64(ceil_div(slice_range, step))
-    return out
-
-
 @_reg.register_shape_func("strided_slice", False)
 def strided_slice_shape_func(attrs, inputs, _):
     """
     Shape func for strided_slice
     """
     slice_mode = convert(0 if attrs.slice_mode == "end" else 1)
-    if attrs.axes is None:
-        return [
-            _strided_slice_shape_func_input_shape(
-                inputs[0], attrs.begin, attrs.end, attrs.strides, slice_mode
-            )
-        ]
     return [
-        _strided_slice_shape_func_with_axes(
-            inputs[0], attrs.begin, attrs.end, attrs.strides, slice_mode, attrs.axes
+        _strided_slice_shape_func_input_shape(
+            inputs[0], attrs.begin, attrs.end, attrs.strides, slice_mode
         )
     ]
 
@@ -900,9 +843,9 @@ def tile_shape_func(attrs, inputs, _):
 
 
 @script
-def _split_shape_func(data_shape, index, indices_or_sections, param_is_indices, axis):
+def _split_shape_func(data_shape, index, indices_or_sections, axis):
     out = output_tensor((data_shape.shape[0],), "int64")
-    if param_is_indices:
+    if len(indices_or_sections) == 1:
         for i in const_range(data_shape.shape[0]):
             if i == axis:
                 assert (
@@ -950,18 +893,10 @@ def split_shape_func(attrs, inputs, _):
         if isinstance(indices_or_sections, int)
         else len(indices_or_sections) + 1
     )
-
-    param_is_indices = isinstance(indices_or_sections, int)
-    if param_is_indices:
+    if isinstance(indices_or_sections, int):
         indices_or_sections = [indices_or_sections]
     return [
-        _split_shape_func(
-            inputs[0],
-            convert(i),
-            convert(indices_or_sections),
-            convert(param_is_indices),
-            convert(axis),
-        )
+        _split_shape_func(inputs[0], convert(i), convert(indices_or_sections), convert(axis))
         for i in range(num_out)
     ]
 
@@ -1174,23 +1109,3 @@ def gather_nd_shape_func(attrs, inputs, _):
     assert index_rank > 0, "index_rank needs to be specified for dynamic gather_nd"
 
     return [_gather_nd_shape(inputs[0], inputs[1], convert(batch_dims), convert(index_rank))]
-
-
-@script
-def _gather_shape(data_shape, indices_shape, axis):
-    out_shape = output_tensor((data_shape.shape[0],), "int64")
-    for i in range(data_shape.shape[0]):
-        if i != axis:
-            assert (
-                data_shape[i] == indices_shape[i]
-            ), "data and indices size at non-gather axes must be the same"
-        out_shape[i] = indices_shape[i]
-    return out_shape
-
-
-@_reg.register_shape_func("gather", False)
-def gather_shape_func(attrs, inputs, _):
-    """
-    Shape func for gather operator.
-    """
-    return [_gather_shape(inputs[0], inputs[1], attrs.axis)]

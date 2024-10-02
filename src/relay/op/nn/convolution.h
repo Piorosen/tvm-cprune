@@ -871,12 +871,8 @@ bool Conv1DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
     dilated_ksize_x = 1 + (param->kernel_size[0] - 1) * param->dilation[0];
     channels = param->channels;
 
-    DataType weight_dtype = data->dtype;
-    if (weight != nullptr) {
-      weight_dtype = weight->dtype;
-    }
     // assign result to reporter
-    reporter->Assign(types[1], TensorType(wshape, weight_dtype));
+    reporter->Assign(types[1], TensorType(wshape, data->dtype));
   } else {
     // use weight to infer the conv shape.
     if (weight == nullptr) return false;
@@ -969,12 +965,8 @@ bool Conv3DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
     dilated_ksize_x = 1 + (param->kernel_size[2] - 1) * param->dilation[2];
     channels = param->channels;
 
-    DataType weight_dtype = data->dtype;
-    if (weight != nullptr) {
-      weight_dtype = weight->dtype;
-    }
     // assign result to reporter
-    reporter->Assign(types[1], TensorType(wshape, weight_dtype));
+    reporter->Assign(types[1], TensorType(wshape, data->dtype));
   } else {
     // use weight to infer the conv shape.
     if (weight == nullptr) return false;
@@ -1044,7 +1036,7 @@ bool Conv2DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
   if (data == nullptr) return false;
 
   static const Layout kNCHW("NCHW");
-  static const Layout kIOHW("IOHW");
+  static const Layout kOIHW("OIHW");
 
   const Conv2DTransposeAttrs* param = attrs.as<AttrType>();
   ICHECK(param != nullptr);
@@ -1053,18 +1045,18 @@ bool Conv2DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
 
   const auto trans_in_layout = tir::BijectiveLayout(in_layout, kNCHW);
   ICHECK(trans_in_layout.defined())
-      << "Conv2DTransposed only support input layouts that are convertible from NCHW."
+      << "Conv only support input layouts that are convertible from NCHW."
       << " But got " << in_layout;
 
-  const auto trans_kernel_layout = tir::BijectiveLayout(kernel_layout, kIOHW);
+  const auto trans_kernel_layout = tir::BijectiveLayout(kernel_layout, kOIHW);
   ICHECK(trans_kernel_layout.defined())
-      << "Conv2DTransposed only support kernel layouts that are convertible from IOHW."
+      << "Conv only support kernel layouts that are convertible from OIHW."
       << " But got " << kernel_layout;
 
   Layout out_layout(param->out_layout == "" ? param->data_layout : param->out_layout);
   const auto trans_out_layout = tir::BijectiveLayout(out_layout, kNCHW);
   ICHECK(trans_out_layout.defined())
-      << "Conv2DTransposed only support output layouts that are convertible from NCHW."
+      << "Conv only support output layouts that are convertible from NCHW."
       << " But got " << out_layout;
 
   IndexExpr channels, dilated_ksize_y, dilated_ksize_x;
@@ -1084,12 +1076,8 @@ bool Conv2DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
     dilated_ksize_x = 1 + (param->kernel_size[1] - 1) * param->dilation[1];
     channels = param->channels;
 
-    DataType weight_dtype = data->dtype;
-    if (weight != nullptr) {
-      weight_dtype = weight->dtype;
-    }
     // assign result to reporter
-    reporter->Assign(types[1], TensorType(wshape, weight_dtype));
+    reporter->Assign(types[1], TensorType(wshape, data->dtype));
   } else {
     // use weight to infer the conv shape.
     if (weight == nullptr) return false;
@@ -1099,21 +1087,16 @@ bool Conv2DTransposeRel(const Array<Type>& types, int num_inputs, const Attrs& a
       // check the size
       ICHECK(reporter->AssertEQ(param->kernel_size[0], wshape[2]) &&
              reporter->AssertEQ(param->kernel_size[1], wshape[3]))
-          << "Conv2DTransposed: shape of weight is inconsistent with kernel_size, "
+          << "Conv2D: shape of weight is inconsistent with kernel_size, "
           << " kernel_size=" << param->kernel_size << " wshape=" << Array<IndexExpr>(wshape);
     }
     if (param->channels.defined()) {
-      ICHECK(reporter->AssertEQ(indexdiv(param->channels, param->groups), wshape[1]))
-          << "Conv2DTransposed: shape of weight is inconsistent with out_channels, "
-          << " out_channels // groups != weight.shape[1] "
-          << " out_channels=" << param->channels << " groups=" << param->groups
-          << " weight.shape=" << Array<IndexExpr>(wshape);
+      ICHECK(reporter->AssertEQ(param->channels, wshape[1]))
+          << "Conv2D: shape of weight is inconsistent with channels, "
+          << " channels=" << param->channels << " wshape=" << Array<IndexExpr>(wshape);
     }
     if (!dshape_nchw[1].as<tir::AnyNode>() && !wshape[0].as<tir::AnyNode>()) {
-      ICHECK(reporter->AssertEQ(dshape_nchw[1], wshape[0]))
-          << "Conv2DTransposed: shape of weight is inconsistent with in_channels."
-          << " data.shape= " << Array<IndexExpr>(dshape_nchw) << " groups= " << param->groups
-          << " weight.shape= " << Array<IndexExpr>(wshape);
+      ICHECK(reporter->AssertEQ(indexdiv(dshape_nchw[1], param->groups), wshape[0]));
     }
     channels = wshape[1];
     dilated_ksize_y = 1 + (wshape[2] - 1) * param->dilation[0];
@@ -1260,26 +1243,29 @@ bool DeformableConv2DRel(const Array<Type>& types, int num_inputs, const Attrs& 
 }
 
 template <typename AttrType>
-InferCorrectLayoutOutput DeformableConvInferCorrectLayout(
+Array<Array<Layout> > DeformableConvInferCorrectLayout(
     const Attrs& attrs, const Array<Layout>& new_in_layouts, const Array<Layout>& old_in_layouts,
     const Array<tvm::relay::Type>& old_in_types) {
   const AttrType* params = attrs.as<AttrType>();
-  return InferCorrectLayoutOutput(
+
+  // Layout of {data, offet, kernel}, {out}
+  return Array<Array<Layout> >{
       {params->data_layout, params->data_layout, params->kernel_layout},
-      {params->out_layout == "" ? params->data_layout : params->out_layout}, attrs);
+      {params->out_layout == "" ? params->data_layout : params->out_layout}};
 }
 
 template <typename T>
-InferCorrectLayoutOutput ConvInferCorrectLayout(const Attrs& attrs,
-                                                const Array<Layout>& new_in_layouts,
-                                                const Array<Layout>& old_in_layouts,
-                                                const Array<tvm::relay::Type>& old_in_types) {
+Array<Array<Layout> > ConvInferCorrectLayout(const Attrs& attrs,
+                                             const Array<Layout>& new_in_layouts,
+                                             const Array<Layout>& old_in_layouts,
+                                             const Array<tvm::relay::Type>& old_in_types) {
   const T* params = attrs.as<T>();
+
   // We always make other operators to fit the layouts of convolution layers
   // So this inference ignores all inputs
-  return InferCorrectLayoutOutput(
+  return Array<Array<Layout> >{
       {params->data_layout, params->kernel_layout},
-      {params->out_layout == "" ? params->data_layout : params->out_layout}, attrs);
+      {params->out_layout == "" ? params->data_layout : params->out_layout}};
 }
 
 }  // namespace relay

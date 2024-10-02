@@ -41,7 +41,7 @@ def register(inputs: Union[Callable, type]) -> type:
     registration: type
     if isinstance(inputs, types.FunctionType):
         # is function
-        from .tir.intrin import Intrin
+        from .intrin import Intrin
 
         def create_new_intrin(func) -> type:
             class NewIntrin(Intrin):

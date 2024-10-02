@@ -68,7 +68,7 @@ class Frontend(ABC):
 
         Returns
         -------
-        mod : tvm.IRModule
+        mod : tvm.relay.Module
             The produced relay module.
         params : dict
             The parameters (weights) for the relay module.
@@ -77,7 +77,7 @@ class Frontend(ABC):
 
 
 def import_keras():
-    """Lazy import function for Keras"""
+    """ Lazy import function for Keras"""
     # Keras writes the message "Using TensorFlow backend." to stderr
     # Redirect stderr during the import to disable this
     stderr = sys.stderr
@@ -93,7 +93,7 @@ def import_keras():
 
 
 class KerasFrontend(Frontend):
-    """Keras frontend for TVMC"""
+    """ Keras frontend for TVMC """
 
     @staticmethod
     def name():
@@ -151,7 +151,7 @@ class KerasFrontend(Frontend):
 
 
 class OnnxFrontend(Frontend):
-    """ONNX frontend for TVMC"""
+    """ ONNX frontend for TVMC """
 
     @staticmethod
     def name():
@@ -172,7 +172,7 @@ class OnnxFrontend(Frontend):
 
 
 class TensorflowFrontend(Frontend):
-    """TensorFlow frontend for TVMC"""
+    """ TensorFlow frontend for TVMC """
 
     @staticmethod
     def name():
@@ -199,7 +199,7 @@ class TensorflowFrontend(Frontend):
 
 
 class TFLiteFrontend(Frontend):
-    """TFLite frontend for TVMC"""
+    """ TFLite frontend for TVMC """
 
     @staticmethod
     def name():
@@ -237,7 +237,7 @@ class TFLiteFrontend(Frontend):
 
 
 class PyTorchFrontend(Frontend):
-    """PyTorch frontend for TVMC"""
+    """ PyTorch frontend for TVMC """
 
     @staticmethod
     def name():
@@ -262,34 +262,7 @@ class PyTorchFrontend(Frontend):
         input_shapes = list(shape_dict.items())
 
         logger.debug("parse Torch model and convert into Relay computation graph")
-        return relay.frontend.from_pytorch(
-            traced_model, input_shapes, keep_quantized_weight=True, **kwargs
-        )
-
-
-class PaddleFrontend(Frontend):
-    """PaddlePaddle frontend for TVMC"""
-
-    @staticmethod
-    def name():
-        return "paddle"
-
-    @staticmethod
-    def suffixes():
-        return ["pdmodel", "pdiparams"]
-
-    def load(self, path, shape_dict=None, **kwargs):
-        # pylint: disable=C0415
-        import paddle
-
-        paddle.enable_static()
-        paddle.disable_signal_handler()
-
-        # pylint: disable=E1101
-        exe = paddle.static.Executor(paddle.CPUPlace())
-        prog, _, _ = paddle.static.load_inference_model(path, exe)
-
-        return relay.frontend.from_paddle(prog, shape_dict=shape_dict, **kwargs)
+        return relay.frontend.from_pytorch(traced_model, input_shapes, **kwargs)
 
 
 ALL_FRONTENDS = [
@@ -298,7 +271,6 @@ ALL_FRONTENDS = [
     TensorflowFrontend,
     TFLiteFrontend,
     PyTorchFrontend,
-    PaddleFrontend,
 ]
 
 

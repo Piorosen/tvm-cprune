@@ -25,8 +25,10 @@
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 
+#include <limits>
+#include <memory>
+
 #include "../../support/str_escape.h"
-#include "buffer_common.h"
 
 namespace tvm {
 namespace tir {
@@ -87,18 +89,6 @@ Var Var::copy_with_suffix(const String& suffix) const {
     new_ptr = make_object<VarNode>(*node);
   }
   new_ptr->name_hint = new_ptr->name_hint + suffix;
-  return Var(new_ptr);
-}
-
-Var Var::copy_with_dtype(DataType dtype) const {
-  const VarNode* node = get();
-  ObjectPtr<VarNode> new_ptr;
-  if (auto* ptr = this->as<SizeVarNode>()) {
-    new_ptr = make_object<SizeVarNode>(*ptr);
-  } else {
-    new_ptr = make_object<VarNode>(*node);
-  }
-  new_ptr->dtype = std::move(dtype);
   return Var(new_ptr);
 }
 
@@ -628,42 +618,8 @@ Load::Load(DataType dtype, Var buffer_var, PrimExpr index, PrimExpr predicate, S
   ICHECK(buffer_var.defined());
   ICHECK(predicate.defined());
   ICHECK(index.defined());
-
-  // Assume that the array elements have 1 lane, unless a type
-  // annotation tells us otherwise.
-  int element_lanes = 1;
-  auto pointer_type = tir::GetPointerType(buffer_var->type_annotation);
-  if (pointer_type.first) {
-    // Cannot check element type of array, as it may be different than
-    // the loaded type in some cases.
-    //
-    // 1. Booleans use DataType::Int(8) while stored, and the codegens
-    // handle cast to boolean.
-    //
-    // 2. The StorageRewrite pass can merge multiple allocations at
-    // the same scope, regardless of element type.  The codegen is
-    // then responsible for casting to the output type.
-
-    // TODO(Lunderberg): Uncomment this check once it can be applied.
-    // See https://discuss.tvm.apache.org/t/pre-rfc-vectorized-tir-buffers/10615
-    // for discussion.
-
-    // ICHECK(dtype.element_of() == pointer_type.second.element_of())
-    //     << "Type mismatch, cannot load type " << dtype << " from buffer " <<
-    //     buffer_var->name_hint
-    //     << " of type " << pointer_type.second;
-    element_lanes = pointer_type.second.lanes();
-  }
-
-  // The C-based codegens assume that all loads occur on a array with
-  // non-vectorized elements, and cast between
-  // vectorized/non-vectorized arrays as needed.  Ideally, these
-  // should be changed to explicit casts in the TIR graph, rather than
-  // being handled at the code-gen level.
-  ICHECK((dtype.lanes() == element_lanes * index.dtype().lanes()) ||
-         (dtype.lanes() == index.dtype().lanes()));
-  ICHECK((dtype.lanes() == element_lanes * predicate.dtype().lanes()) ||
-         (dtype.lanes() == index.dtype().lanes()));
+  ICHECK_EQ(dtype.lanes(), index.dtype().lanes());
+  ICHECK_EQ(dtype.lanes(), predicate.dtype().lanes());
 
   ObjectPtr<LoadNode> node = make_object<LoadNode>();
   node->dtype = dtype;
@@ -916,35 +872,6 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
 // CommReducer
 CommReducer::CommReducer(Array<Var> lhs, Array<Var> rhs, Array<PrimExpr> result,
                          Array<PrimExpr> identity_element, Span span) {
-  size_t n_group = result.size();
-  CHECK_EQ(lhs.size(), n_group) << "ValueError: The number of vars in `lhs` must equal to the "
-                                   "number of elements in `results`";
-  CHECK_EQ(rhs.size(), n_group) << "ValueError: The number of vars in `rhs` must equal to the "
-                                   "number of elements in `results`";
-  CHECK_EQ(identity_element.size(), n_group)
-      << "ValueError: The number of identities must equal to the number of elements in `results`";
-
-  // Change the dtype of input vars to adapt to the dtype of identities
-  ArrayNode* p_lhs = lhs.CopyOnWrite();
-  ArrayNode* p_rhs = rhs.CopyOnWrite();
-  std::unordered_map<const VarNode*, PrimExpr> var_map;
-  var_map.reserve(n_group * 2);
-  for (int i = 0; i < static_cast<int>(n_group); ++i) {
-    DataType dtype = identity_element[i].dtype();
-    Var l = lhs[i].copy_with_dtype(dtype);
-    Var r = rhs[i].copy_with_dtype(dtype);
-    var_map[lhs[i].get()] = l;
-    var_map[rhs[i].get()] = r;
-
-    p_lhs->SetItem(i, l);
-    p_rhs->SetItem(i, r);
-  }
-
-  ArrayNode* p_result = result.CopyOnWrite();
-  for (int i = 0; i < static_cast<int>(n_group); ++i) {
-    p_result->SetItem(i, Substitute(result[i], var_map));
-  }
-
   auto node = make_object<CommReducerNode>();
   node->lhs = lhs;
   node->rhs = rhs;

@@ -74,7 +74,7 @@ def build(sch, inputs, outputs, name="hybrid_func"):
 
     Parameters
     ----------
-    sch: tvm.te.Schedule
+    sch: Schedule
         The schedule to be dumped
 
     inputs: An array of Tensors or Vars

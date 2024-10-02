@@ -170,11 +170,7 @@ class MemoryAccessVerifier final : protected StmtExprVisitor {
 /// Interface of VerifyMemory pass
 std::vector<String> VerifyMemory_(const PrimFunc& func) {
   auto target = func->GetAttr<Target>(tvm::attr::kTarget);
-  ICHECK(target.defined()) << "VerifyMemory: Require the target attribute";
-
-  VLOG(1) << "verifying memory for target '" << target.value()->str()
-          << "' for primitive:" << std::endl
-          << PrettyPrint(func);
+  ICHECK(target.defined()) << "LowerWarpMemory: Require the target attribute";
 
   if (func->GetAttr<Integer>(tvm::attr::kCallingConv, Integer(CallingConv::kDefault)) ==
       CallingConv::kDefault) {

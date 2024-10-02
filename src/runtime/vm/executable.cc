@@ -61,8 +61,6 @@ PackedFunc Executable::GetFunction(const std::string& name, const ObjectPtr<Obje
   } else if (name == "get_bytecode") {
     return PackedFunc(
         [sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->GetBytecode(); });
-  } else if (name == "get_constants") {
-    return PackedFunc([this](TVMArgs args, TVMRetValue* rv) { *rv = this->GetConstants(); });
   } else if (name == "get_stats") {
     return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->Stats(); });
   } else if (name == "save") {
@@ -145,34 +143,6 @@ std::string Executable::GetBytecode() const {
     oss << std::endl;
   }
 
-  return oss.str();
-}
-
-namespace {
-String ShapeString(const ShapeTuple& shape_tuple, DLDataType dtype) {
-  std::stringstream sizes;
-  sizes << DLDataType2String(dtype) << "[";
-  for (size_t i = 0; i < shape_tuple.size(); i++) {
-    if (i != 0) {
-      sizes << ", ";
-    }
-    sizes << shape_tuple.data()[i];
-  }
-  sizes << "]";
-  return String(sizes.str());
-}
-}  // namespace
-
-std::string Executable::GetConstants() const {
-  std::ostringstream oss;
-
-  for (size_t i = 0; i < constants.size(); ++i) {
-    const auto& constant = constants[i];
-    auto ndarray = Downcast<NDArray>(constant);
-    DLDeviceType device_type = static_cast<DLDeviceType>(const_device_type[i]);
-    oss << "VM Constant[" << i << "]: has shape " << ShapeString(ndarray.Shape(), ndarray->dtype)
-        << " on device of type " << device_type << std::endl;
-  }
   return oss.str();
 }
 
@@ -264,8 +234,8 @@ TVMByteArray Executable::Save() {
 }
 
 void Executable::SaveGlobalSection(dmlc::Stream* strm) {
-  std::vector<std::pair<std::string, Index>> globals(this->global_map.begin(),
-                                                     this->global_map.end());
+  std::vector<std::pair<std::string, Index> > globals(this->global_map.begin(),
+                                                      this->global_map.end());
   auto comp = [](const std::pair<std::string, Index>& a, const std::pair<std::string, Index>& b) {
     return a.second < b.second;
   };
@@ -303,20 +273,6 @@ void Executable::SavePrimitiveOpNames(dmlc::Stream* strm) {
     primitive_names[packed_index] = it.first;
   }
   strm->Write(primitive_names);
-  std::map<uint64_t, std::map<std::string, std::string>> primitive_attrs;
-  for (const auto& it : this->op_attrs) {
-    auto packed_index = static_cast<size_t>(it.first);
-    std::map<std::string, std::string> attrs;
-    for (const auto& elem : it.second) {
-      // TODO(tkonolige): cannot serialize ObjectRefs with dmlc's serializer, so we just serialize
-      // strings for now
-      if (elem.second.as<StringObj>()) {
-        attrs[elem.first] = Downcast<String>(elem.second);
-      }
-    }
-    primitive_attrs[packed_index] = attrs;
-  }
-  strm->Write(primitive_attrs);
 }
 
 // Serialize a virtual machine instruction. It creates a list that contains the
@@ -338,7 +294,7 @@ void Executable::SavePrimitiveOpNames(dmlc::Stream* strm) {
 VMInstructionSerializer SerializeInstruction(const Instruction& instr) {
   std::vector<Index> fields;
   // Save the opcode.
-  VLOG(1) << "Serializing: " << instr << std::endl;
+  DLOG(INFO) << "Serializing: " << instr << std::endl;
   switch (instr.op) {
     case Opcode::Move: {
       // Number of fields = 2
@@ -612,16 +568,6 @@ void Executable::LoadPrimitiveOpNames(dmlc::Stream* strm) {
   STREAM_CHECK(strm->Read(&primitive_names), "primitive name");
   for (size_t i = 0; i < primitive_names.size(); i++) {
     this->primitive_map.insert({primitive_names[i], i});
-  }
-
-  std::map<uint64_t, std::map<std::string, std::string>> primitive_attrs;
-  STREAM_CHECK(strm->Read(&primitive_attrs), "primitive attrs");
-  for (const auto& fn : primitive_attrs) {
-    std::vector<std::pair<String, ObjectRef>> attrs;
-    for (const auto& elem : fn.second) {
-      attrs.push_back({elem.first, String(elem.second)});
-    }
-    this->op_attrs[fn.first] = Map<String, ObjectRef>(attrs.begin(), attrs.end());
   }
 }
 
@@ -905,8 +851,8 @@ TVM_REGISTER_GLOBAL("runtime.GetGlobalFields").set_body([](TVMArgs args, TVMRetV
   const auto* exec = dynamic_cast<Executable*>(mod.operator->());
   ICHECK(exec);
   int idx = args[1];
-  std::vector<std::pair<std::string, Index>> globals(exec->global_map.begin(),
-                                                     exec->global_map.end());
+  std::vector<std::pair<std::string, Index> > globals(exec->global_map.begin(),
+                                                      exec->global_map.end());
   auto comp = [](const std::pair<std::string, Index>& a, const std::pair<std::string, Index>& b) {
     return a.second < b.second;
   };

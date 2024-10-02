@@ -24,8 +24,7 @@
 #ifndef TVM_RUNTIME_VM_EXECUTABLE_H_
 #define TVM_RUNTIME_VM_EXECUTABLE_H_
 
-#include <tvm/runtime/container/map.h>
-#include <tvm/runtime/container/string.h>
+#include <tvm/runtime/container.h>
 #include <tvm/runtime/module.h>
 #include <tvm/runtime/object.h>
 #include <tvm/runtime/packed_func.h>
@@ -130,13 +129,6 @@ class Executable : public ModuleNode {
    * doesn't contain it, therefore the deserializer doens't need to handle it.
    */
   std::string GetBytecode() const;
-
-  /*!
-   * \brief Returns a description of all the contants in the executable in human-readable
-   * format. Not intended to be machine readable, but rather to help with debugging and
-   * diffing generated code.
-   */
-  std::string GetConstants() const;
 
   /*!
    * \brief Print the detailed statistics of the given code, i.e. number of

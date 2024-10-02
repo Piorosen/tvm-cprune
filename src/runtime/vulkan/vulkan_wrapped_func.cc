@@ -25,6 +25,7 @@
 
 #include "../file_utils.h"
 #include "vulkan_device_api.h"
+#include "vulkan_thread_entry.h"
 
 namespace tvm {
 namespace runtime {
@@ -33,24 +34,25 @@ namespace vulkan {
 void VulkanWrappedFunc::Init(VulkanModuleNode* m, ObjectPtr<Object> sptr,
                              const std::string& func_name, size_t num_buffer_args,
                              size_t num_pack_args,
-                             const std::vector<std::string>& launch_param_tags) {
+                             const std::vector<std::string>& thread_axis_tags) {
   m_ = m;
   sptr_ = sptr;
   func_name_ = func_name;
   num_buffer_args_ = num_buffer_args;
   num_pack_args_ = num_pack_args;
-  launch_param_config_.Init(num_buffer_args + num_pack_args, launch_param_tags);
+  thread_axis_cfg_.Init(num_buffer_args + num_pack_args, thread_axis_tags);
 }
 
 void VulkanWrappedFunc::operator()(TVMArgs args, TVMRetValue* rv,
                                    const ArgUnion64* pack_args) const {
-  int device_id = VulkanDeviceAPI::Global()->GetActiveDeviceID();
-  auto& device = VulkanDeviceAPI::Global()->device(device_id);
+  int device_id = VulkanThreadEntry::ThreadLocal()->device.device_id;
+  ICHECK_LT(device_id, kVulkanMaxNumDevice);
+  const auto& vctx = VulkanDeviceAPI::Global()->context(device_id);
   if (!scache_[device_id]) {
     scache_[device_id] = m_->GetPipeline(device_id, func_name_, num_pack_args_);
   }
   const auto& pipeline = scache_[device_id];
-  ThreadWorkLoad wl = launch_param_config_.Extract(args);
+  ThreadWorkLoad wl = thread_axis_cfg_.Extract(args);
   std::vector<VkDescriptorBufferInfo> descriptor_buffers;
   descriptor_buffers.resize(num_buffer_args_);
   for (size_t i = 0; i < num_buffer_args_; ++i) {
@@ -63,25 +65,26 @@ void VulkanWrappedFunc::operator()(TVMArgs args, TVMRetValue* rv,
   }
   const size_t nbytes_scalars = num_pack_args_ * sizeof(ArgUnion64);
   if (pipeline->use_ubo) {
-    auto& ubo = device.ThreadLocalUniformBuffer(nbytes_scalars);
+    auto ubo = VulkanThreadEntry::ThreadLocal()->GetUniformBuffer(device_id, nbytes_scalars);
+    CHECK(ubo->host_addr) << "The UBO host buffer is not allocated";
     VkDescriptorBufferInfo binfo;
-    binfo.buffer = ubo.vk_buf.buffer;
+    binfo.buffer = ubo->vk_buf->buffer;
     binfo.offset = 0;
     binfo.range = VK_WHOLE_SIZE;
     descriptor_buffers.push_back(binfo);
   }
-  if (device.UseImmediate()) {
+  if (vctx.UseImmediate()) {
     // Can safely capture by reference as this lambda is immediately executed on the calling thread.
-    device.ThreadLocalStream().Launch([&](VulkanStreamState* state) {
+    VulkanThreadEntry::ThreadLocal()->Stream(device_id)->Launch([&](VulkanStreamState* state) {
       vkCmdBindPipeline(state->cmd_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
       ICHECK(pipeline->descriptor_update_template != VK_NULL_HANDLE);
-      device.descriptor_template_khr_functions->vkCmdPushDescriptorSetWithTemplateKHR(
+      vctx.descriptor_template_khr_functions->vkCmdPushDescriptorSetWithTemplateKHR(
           state->cmd_buffer_, pipeline->descriptor_update_template, pipeline->pipeline_layout, 0,
           descriptor_buffers.data());
 
       if (pipeline->use_ubo) {
-        auto& ubo = device.ThreadLocalUniformBuffer(nbytes_scalars);
-        memcpy(ubo.host_addr, pack_args, nbytes_scalars);
+        auto ubo = VulkanThreadEntry::ThreadLocal()->GetUniformBuffer(device_id, nbytes_scalars);
+        memcpy(ubo->host_addr, pack_args, nbytes_scalars);
       } else if (num_pack_args_ > 0) {
         vkCmdPushConstants(state->cmd_buffer_, pipeline->pipeline_layout,
                            VK_SHADER_STAGE_COMPUTE_BIT, 0, num_pack_args_ * sizeof(ArgUnion64),
@@ -104,7 +107,7 @@ void VulkanWrappedFunc::operator()(TVMArgs args, TVMRetValue* rv,
 
   // Otherwise, the more expensive deferred path.
   std::vector<ArgUnion64> pack_args_storage(pack_args, pack_args + num_pack_args_);
-  const auto& deferred_initializer = [&device, pipeline, descriptor_buffers]() {
+  const auto& deferred_initializer = [&vctx, pipeline, descriptor_buffers]() {
     std::vector<VkWriteDescriptorSet> write_descriptor_sets;
     write_descriptor_sets.resize(descriptor_buffers.size());
     for (size_t i = 0; i < write_descriptor_sets.size(); i++) {
@@ -125,21 +128,19 @@ void VulkanWrappedFunc::operator()(TVMArgs args, TVMRetValue* rv,
         write_descriptor_sets[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       }
     }
-    vkUpdateDescriptorSets(device, write_descriptor_sets.size(), write_descriptor_sets.data(), 0,
-                           0);
+    vkUpdateDescriptorSets(vctx.device, write_descriptor_sets.size(), write_descriptor_sets.data(),
+                           0, 0);
   };
   const auto& deferred_kernel = [this, pipeline, wl, pack_args_storage, nbytes_scalars,
                                  device_id](VulkanStreamState* state) {
-    auto& device = VulkanDeviceAPI::Global()->device(device_id);
-
     vkCmdBindPipeline(state->cmd_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
     vkCmdBindDescriptorSets(state->cmd_buffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pipeline->pipeline_layout, 0, 1, &(pipeline->descriptor_set), 0,
                             nullptr);
 
     if (pipeline->use_ubo) {
-      auto& ubo = device.ThreadLocalUniformBuffer(nbytes_scalars);
-      memcpy(ubo.host_addr, pack_args_storage.data(), nbytes_scalars);
+      auto ubo = VulkanThreadEntry::ThreadLocal()->GetUniformBuffer(device_id, nbytes_scalars);
+      memcpy(ubo->host_addr, pack_args_storage.data(), nbytes_scalars);
     } else if (num_pack_args_ > 0) {
       vkCmdPushConstants(state->cmd_buffer_, pipeline->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                          0, pack_args_storage.size() * sizeof(ArgUnion64),
@@ -163,7 +164,8 @@ void VulkanWrappedFunc::operator()(TVMArgs args, TVMRetValue* rv,
   for (size_t i = 0; i < descriptor_buffers.size(); ++i) {
     deferred_token.buffers_[i] = descriptor_buffers[i].buffer;
   }
-  device.ThreadLocalStream().LaunchDeferred(deferred_initializer, deferred_kernel, deferred_token);
+  VulkanThreadEntry::ThreadLocal()->Stream(device_id)->LaunchDeferred(
+      deferred_initializer, deferred_kernel, deferred_token);
 }
 
 VulkanModuleNode::~VulkanModuleNode() {
@@ -172,17 +174,17 @@ VulkanModuleNode::~VulkanModuleNode() {
     for (auto& kv : ecache_[device_id]) {
       auto& pe = kv.second;
       ICHECK(pe);
-      const auto& device = VulkanDeviceAPI::Global()->device(device_id);
+      const auto& vctx = VulkanDeviceAPI::Global()->context(device_id);
 
       if (pe->descriptor_update_template != VK_NULL_HANDLE) {
-        device.descriptor_template_khr_functions->vkDestroyDescriptorUpdateTemplateKHR(
-            device, pe->descriptor_update_template, nullptr);
+        vctx.descriptor_template_khr_functions->vkDestroyDescriptorUpdateTemplateKHR(
+            vctx.device, pe->descriptor_update_template, nullptr);
       }
-      vkDestroyPipeline(device, pe->pipeline, nullptr);
-      vkDestroyPipelineLayout(device, pe->pipeline_layout, nullptr);
-      vkDestroyDescriptorPool(device, pe->descriptor_pool, nullptr);
-      vkDestroyDescriptorSetLayout(device, pe->descriptor_set_layout, nullptr);
-      vkDestroyShaderModule(device, pe->shader, nullptr);
+      vkDestroyPipeline(vctx.device, pe->pipeline, nullptr);
+      vkDestroyPipelineLayout(vctx.device, pe->pipeline_layout, nullptr);
+      vkDestroyDescriptorPool(vctx.device, pe->descriptor_pool, nullptr);
+      vkDestroyDescriptorSetLayout(vctx.device, pe->descriptor_set_layout, nullptr);
+      vkDestroyShaderModule(vctx.device, pe->shader, nullptr);
     }
   }
 }
@@ -197,14 +199,14 @@ PackedFunc VulkanModuleNode::GetFunction(const std::string& name,
   VulkanWrappedFunc f;
   size_t num_buffer_args = NumBufferArgs(info.arg_types);
   f.Init(this, sptr_to_self, name, num_buffer_args, info.arg_types.size() - num_buffer_args,
-         info.launch_param_tags);
+         info.thread_axis_tags);
   return PackFuncNonBufferArg(std::move(f), info.arg_types);
 }
 
 std::shared_ptr<VulkanPipeline> VulkanModuleNode::GetPipeline(size_t device_id,
                                                               const std::string& func_name,
                                                               size_t num_pack_args) {
-  auto& device = VulkanDeviceAPI::Global()->device(device_id);
+  const auto& vctx = VulkanDeviceAPI::Global()->context(device_id);
   std::lock_guard<std::mutex> lock(mutex_);
   const auto& cp = ecache_[device_id][func_name];
   if (cp) {
@@ -224,7 +226,7 @@ std::shared_ptr<VulkanPipeline> VulkanModuleNode::GetPipeline(size_t device_id,
     shader_cinfo.flags = 0;
     shader_cinfo.codeSize = data.size() * sizeof(uint32_t);
     shader_cinfo.pCode = data.data();
-    VULKAN_CALL(vkCreateShaderModule(device, &shader_cinfo, nullptr, &(pe->shader)));
+    VULKAN_CALL(vkCreateShaderModule(vctx.device, &shader_cinfo, nullptr, &(pe->shader)));
   }
   std::vector<VkDescriptorSetLayoutBinding> arg_binding;
   std::vector<VkDescriptorUpdateTemplateEntryKHR> arg_template;
@@ -284,7 +286,7 @@ std::shared_ptr<VulkanPipeline> VulkanModuleNode::GetPipeline(size_t device_id,
   if (pe->use_ubo) {
     // Use UBO instead of push constants
     push_arg_info(num_buffer, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
-    device.AllocateThreadLocalUniformBuffer(nbytes_scalars);
+    VulkanThreadEntry::ThreadLocal()->AllocateUniformBuffer(device_id, nbytes_scalars);
   }
 
   {
@@ -292,16 +294,16 @@ std::shared_ptr<VulkanPipeline> VulkanModuleNode::GetPipeline(size_t device_id,
     descrip_cinfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     descrip_cinfo.pNext = nullptr;
     descrip_cinfo.flags = 0;
-    if (device.UseImmediate()) {
+    if (vctx.UseImmediate()) {
       descrip_cinfo.flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     }
     descrip_cinfo.bindingCount = arg_binding.size();
     descrip_cinfo.pBindings = arg_binding.data();
-    VULKAN_CALL(
-        vkCreateDescriptorSetLayout(device, &descrip_cinfo, nullptr, &(pe->descriptor_set_layout)));
+    VULKAN_CALL(vkCreateDescriptorSetLayout(vctx.device, &descrip_cinfo, nullptr,
+                                            &(pe->descriptor_set_layout)));
   }
 
-  if (!device.UseImmediate()) {
+  if (!vctx.UseImmediate()) {
     VkDescriptorPoolCreateInfo descrip_pool_cinfo;
     descrip_pool_cinfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     descrip_pool_cinfo.pNext = nullptr;
@@ -310,7 +312,7 @@ std::shared_ptr<VulkanPipeline> VulkanModuleNode::GetPipeline(size_t device_id,
     descrip_pool_cinfo.poolSizeCount = descriptor_set_pool_sizes.size();
     descrip_pool_cinfo.pPoolSizes = descriptor_set_pool_sizes.data();
     VULKAN_CALL(
-        vkCreateDescriptorPool(device, &descrip_pool_cinfo, nullptr, &(pe->descriptor_pool)));
+        vkCreateDescriptorPool(vctx.device, &descrip_pool_cinfo, nullptr, &(pe->descriptor_pool)));
 
     VkDescriptorSetAllocateInfo alloc_info;
     alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -318,7 +320,7 @@ std::shared_ptr<VulkanPipeline> VulkanModuleNode::GetPipeline(size_t device_id,
     alloc_info.descriptorPool = pe->descriptor_pool;
     alloc_info.descriptorSetCount = 1;
     alloc_info.pSetLayouts = &(pe->descriptor_set_layout);
-    VULKAN_CALL(vkAllocateDescriptorSets(device, &alloc_info, &(pe->descriptor_set)));
+    VULKAN_CALL(vkAllocateDescriptorSets(vctx.device, &alloc_info, &(pe->descriptor_set)));
   }
 
   VkPushConstantRange crange;
@@ -336,19 +338,13 @@ std::shared_ptr<VulkanPipeline> VulkanModuleNode::GetPipeline(size_t device_id,
   if (0 < nbytes_scalars && !pe->use_ubo) {
     playout_cinfo.pushConstantRangeCount = 1;
     playout_cinfo.pPushConstantRanges = &crange;
-    ICHECK_LE(crange.size, device.device_properties.max_push_constants_size)
-        << "The Vulkan shader uses " << crange.size
-        << " bytes of push constants, but the device only supports "
-        << device.device_properties.max_push_constants_size << "bytes. "
-        << "Please rebuild the shader using a smaller limit on push constants size "
-        << "by passing -max_push_constants_size=N in the Target string, "
-        << "or pass -from_device=0 to query all device parameters.";
+    ICHECK_LE(crange.size, vctx.phy_device_prop.limits.maxPushConstantsSize);
   } else {
     playout_cinfo.pushConstantRangeCount = 0;
     playout_cinfo.pPushConstantRanges = nullptr;
   }
 
-  VULKAN_CALL(vkCreatePipelineLayout(device, &playout_cinfo, nullptr, &(pe->pipeline_layout)));
+  VULKAN_CALL(vkCreatePipelineLayout(vctx.device, &playout_cinfo, nullptr, &(pe->pipeline_layout)));
 
   VkComputePipelineCreateInfo pipeline_cinfo;
   pipeline_cinfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -364,10 +360,10 @@ std::shared_ptr<VulkanPipeline> VulkanModuleNode::GetPipeline(size_t device_id,
   pipeline_cinfo.layout = pe->pipeline_layout;
   pipeline_cinfo.basePipelineHandle = VK_NULL_HANDLE;
   pipeline_cinfo.basePipelineIndex = 0;
-  VULKAN_CALL(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_cinfo, nullptr,
+  VULKAN_CALL(vkCreateComputePipelines(vctx.device, VK_NULL_HANDLE, 1, &pipeline_cinfo, nullptr,
                                        &(pe->pipeline)));
 
-  if (device.UseImmediate()) {
+  if (vctx.UseImmediate()) {
     VkDescriptorUpdateTemplateCreateInfoKHR descrip_template_cinfo;
     descrip_template_cinfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO_KHR;
     descrip_template_cinfo.pNext = 0;
@@ -379,8 +375,8 @@ std::shared_ptr<VulkanPipeline> VulkanModuleNode::GetPipeline(size_t device_id,
     descrip_template_cinfo.pipelineBindPoint = VK_PIPELINE_BIND_POINT_COMPUTE;
     descrip_template_cinfo.pipelineLayout = pe->pipeline_layout;
     descrip_template_cinfo.set = 0;
-    VULKAN_CALL(device.descriptor_template_khr_functions->vkCreateDescriptorUpdateTemplateKHR(
-        device, &descrip_template_cinfo, 0, &(pe->descriptor_update_template)));
+    VULKAN_CALL(vctx.descriptor_template_khr_functions->vkCreateDescriptorUpdateTemplateKHR(
+        vctx.device, &descrip_template_cinfo, 0, &(pe->descriptor_update_template)));
   }
   ecache_[device_id][func_name] = pe;
   return pe;

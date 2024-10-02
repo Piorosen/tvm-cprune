@@ -29,14 +29,7 @@ def libinfo():
     info: Dict[str, str]
         The dictionary of compile-time info.
     """
-    get_lib_info_func = get_global_func("support.GetLibInfo", allow_missing=True)
-    if get_lib_info_func is not None:
-        lib_info = get_lib_info_func()
-        if lib_info is None:
-            return {}
-    else:
-        return {}
-    return dict(lib_info.items())
+    return {k: v for k, v in GetLibInfo().items()}  # pylint: disable=unnecessary-comprehension
 
 
 class FrontendTestModule(Module):

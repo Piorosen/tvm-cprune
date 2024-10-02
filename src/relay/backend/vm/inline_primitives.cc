@@ -87,7 +87,7 @@ struct PrimitiveInliner : ExprMutator {
     // in w(...)
     while ((var_node = op.as<VarNode>())) {
       auto var = GetRef<Var>(var_node);
-      VLOG(1) << "Var: " << var << std::endl;
+      DLOG(INFO) << "Var: " << var << std::endl;
       auto it = var_map.find(GetRef<Var>(var_node));
       if (it != var_map.end()) {
         op = it->second;
@@ -136,13 +136,13 @@ struct PrimitiveInliner : ExprMutator {
         if (n->GetAttr<String>(attr::kCompiler).defined()) continue;
         auto func = GetRef<Function>(n);
 
-        VLOG(1) << "Before inlining primitives: " << global << std::endl << PrettyPrint(func);
+        DLOG(INFO) << "Before inlining primitives: " << global << std::endl << AsText(func, false);
 
         func = Function(func->params, VisitExpr(func->body), func->ret_type, func->type_params,
                         func->attrs);
         module_->Add(global, func, true);
 
-        VLOG(1) << "After inlining primitives: " << global << std::endl << PrettyPrint(func);
+        DLOG(INFO) << "After inlining primitives: " << global << std::endl << AsText(func, false);
       }
     }
     return module_;

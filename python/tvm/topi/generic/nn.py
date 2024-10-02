@@ -428,23 +428,6 @@ def schedule_group_conv2d_nchw(outs):
     return _default_schedule(outs, False)
 
 
-def schedule_group_conv2d_transpose_nchw(outs):
-    """Schedule for group_conv2d_transpose_nchw
-
-    Parameters
-    ----------
-    outs: Array of Tensor
-          The computation graph description of group_conv2d_nhwc
-          in the format of an array of tensors.
-
-    Returns
-    -------
-    sch: Schedule
-        The computation schedule for the op.
-    """
-    return _default_schedule(outs, False)
-
-
 def schedule_group_conv2d_nhwc(outs):
     """Schedule for group_conv2d_nhwc
 
@@ -587,23 +570,6 @@ def schedule_fast_softmax(outs):
     ----------
     outs: Array of Tensor
           The computation graph description of fast_softmax
-          in the format of an array of tensors.
-
-    Returns
-    -------
-    sch: Schedule
-        The computation schedule for the op.
-    """
-    return _default_schedule(outs, False)
-
-
-def schedule_matmul(outs):
-    """Schedule for matmul
-
-    Parameters
-    ----------
-    outs: Array of Tensor
-          The computation graph description of matmul
           in the format of an array of tensors.
 
     Returns

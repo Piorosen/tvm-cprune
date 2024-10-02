@@ -20,6 +20,9 @@
 
 from typing import Hashable
 import json
+import multiprocessing
+import multiprocessing.pool
+import queue
 import signal
 import threading
 import traceback
@@ -187,7 +190,7 @@ def get_const_tuple(in_tuple):
 
 
 def list_to_tuple(x):
-    """Convert a list to a tuple recursively."""
+    """ Convert a list to a tuple recursively. """
     assert isinstance(x, list)
     return tuple(list_to_tuple(y) if isinstance(y, list) else y for y in x)
 
@@ -247,7 +250,7 @@ MAX_TRACEBACK_INFO_LEN = 512
 
 
 def make_traceback_info():
-    """Get the error message from traceback."""
+    """ Get the error message from traceback. """
     info = str(traceback.format_exc())
     if len(info) > MAX_TRACEBACK_INFO_LEN:
         info = (
@@ -286,15 +289,41 @@ def call_func_with_thread(func, args, kwargs):
     return res[0]
 
 
-def call_func_with_timeout(
-    worker, timeout, func, args=(), kwargs=None
-):  # pylint: disable=unused-argument
-    """Call a function with timeout"""
-    worker.send(func, args, kwargs, timeout)
+def _func_wrapper(que, func, args, kwargs, add_thread_wrapper):
+    """Call function and return the result over the queue."""
     try:
-        res = worker.recv()
+        if add_thread_wrapper:
+            # Add a new layer of threadinng to avoid the conflict between
+            # python's multiprocessing and tvm's thread pool.
+            res = call_func_with_thread(func, args, kwargs)
+        else:
+            res = func(*args, **kwargs)
+        que.put(res)
     except Exception:  # pylint: disable=broad-except
-        res = Exception(make_traceback_info())
+        que.put(Exception(make_traceback_info()))
+
+
+def call_func_with_timeout(timeout, func, args=(), kwargs=None, add_thread_wrapper=False):
+    """Call a function with timeout"""
+    que = multiprocessing.Queue(2)
+    process = multiprocessing.Process(
+        target=_func_wrapper, args=(que, func, args, kwargs or {}, add_thread_wrapper)
+    )
+    process.start()
+
+    try:
+        res = que.get(timeout=timeout)
+    except queue.Empty:
+        res = TimeoutError()
+
+    # clean queue and process
+    kill_child_processes(process.pid)
+    process.terminate()
+    process.join()
+    que.close()
+    que.join_thread()
+    del process
+    del que
 
     return res
 

@@ -26,14 +26,12 @@
 #include <tvm/node/structural_hash.h>
 #include <tvm/relay/analysis.h>
 #include <tvm/relay/expr.h>
+#include <tvm/relay/expr_functor.h>
 #include <tvm/relay/transform.h>
 #include <tvm/runtime/logging.h>
 
 #include <iostream>
 #include <vector>
-
-#include "../../op/annotation/annotation.h"
-#include "../../transforms/device_aware_visitors.h"
 
 using namespace tvm::runtime;
 
@@ -46,7 +44,7 @@ inline std::string GenerateName(const Function& func) {
   return std::string("lifted_name") + std::to_string(hash);
 }
 
-bool IsClosure(const Function& func) { return func->HasNonzeroAttr(attr::kClosure); }
+bool IsClosure(const Function& func) { return func->GetAttr<Integer>(attr::kClosure, 0) != 0; }
 
 Function MarkClosure(Function func) {
   return WithAttr(std::move(func), attr::kClosure, tvm::Integer(1));
@@ -58,29 +56,39 @@ Function MarkClosure(Function func) {
  * We will lift a function out into a global which takes the set of the free
  * vars and then return the new created function.
  */
-class LambdaLifter : public transform::DeviceAwareExprMutator {
+class LambdaLifter : public ExprMutator {
  public:
-  explicit LambdaLifter(const IRModule& module)
-      : transform::DeviceAwareExprMutator(module), module_(module) {}
+  explicit LambdaLifter(const IRModule& module) : module_(module) {}
 
-  std::pair<Var, Expr> PreVisitLetBinding_(const Var& var, const Expr& value) final {
-    bool is_lambda = false;
-    if (const auto* func_node = value.as<FunctionNode>()) {
-      if (!func_node->HasNonzeroAttr(attr::kPrimitive)) {
-        is_lambda = true;
-        this->letrec_.push_back(var);
+  Expr VisitExpr_(const LetNode* let_node) final {
+    auto pre_visit = [this](const LetNode* op) {
+      bool is_lambda = false;
+      if (auto func = op->value.as<FunctionNode>()) {
+        if (!func->HasNonzeroAttr(attr::kPrimitive)) {
+          is_lambda = true;
+          this->letrec_.push_back(op->var);
+        }
       }
-    }
-    Expr new_value = this->VisitExpr(value);
+      Expr value = this->VisitExpr(op->value);
 
-    if (is_lambda) {
-      this->letrec_.pop_back();
-    }
-    return {var, new_value};
+      if (is_lambda) {
+        this->letrec_.pop_back();
+      }
+    };
+    auto post_visit = [this](const LetNode* op) {
+      // Rely on the Memoizer to cache pre-visit values
+      Expr value = this->VisitExpr(op->value);
+      // Visit body and cache the op
+      Expr body = this->VisitExpr(op->body);
+      auto expr = GetRef<Expr>(op);
+      this->memo_[expr] = Let(op->var, value, body);
+    };
+    ExpandANormalForm(let_node, pre_visit, post_visit);
+    return memo_[GetRef<Expr>(let_node)];
   }
 
-  Expr DeviceAwareVisitExpr_(const CallNode* call_node) final {
-    auto call = Downcast<Call>(DeviceAwareExprMutator::DeviceAwareVisitExpr_(call_node));
+  Expr VisitExpr_(const CallNode* call_node) final {
+    auto call = Downcast<Call>(ExprMutator::VisitExpr_(call_node));
     if (auto var_node = call_node->op.as<VarNode>()) {
       auto var = GetRef<Var>(var_node);
       if (!letrec_.empty() && var == letrec_.back()) {
@@ -92,18 +100,12 @@ class LambdaLifter : public transform::DeviceAwareExprMutator {
     return std::move(call);
   }
 
-  Expr DeviceAwareVisitExpr_(const FunctionNode* func_node) final {
+  Expr VisitExpr_(const FunctionNode* func_node) final {
     auto func = GetRef<Function>(func_node);
 
+    // We should not transform primitive functions.
     if (func->HasNonzeroAttr(attr::kPrimitive)) {
-      // We should not transform primitive functions.
       return std::move(func);
-    }
-
-    if (function_nesting() == 1) {
-      // We don't need to lift global functions.
-      return Function(func_node->params, VisitExpr(func_node->body), func_node->ret_type,
-                      func_node->type_params, func_node->attrs, func_node->span);
     }
 
     auto name = GenerateName(func);
@@ -112,7 +114,6 @@ class LambdaLifter : public transform::DeviceAwareExprMutator {
     auto free_type_vars = FreeTypeVars(func, module_);
 
     Array<Var> captured_vars;
-    std::vector<DLDeviceType> captured_var_device_types;
     bool recursive = false;
     for (const auto& var : free_vars) {
       if (!letrec_.empty() && var == letrec_.back()) {
@@ -120,10 +121,8 @@ class LambdaLifter : public transform::DeviceAwareExprMutator {
         continue;
       }
       captured_vars.push_back(var);
-      captured_var_device_types.push_back(GetInScopeDeviceType(var));
     }
 
-    // Freshen all the captured vars.
     Array<Var> typed_captured_vars;
     Map<Var, Expr> rebinding_map;
     for (auto free_var : captured_vars) {
@@ -131,8 +130,6 @@ class LambdaLifter : public transform::DeviceAwareExprMutator {
       typed_captured_vars.push_back(var);
       rebinding_map.Set(free_var, var);
     }
-
-    DLDeviceType result_device_type = GetInScopeDeviceType(func_node->body);
 
     if (recursive) {
       if (!captured_vars.empty()) {
@@ -146,7 +143,7 @@ class LambdaLifter : public transform::DeviceAwareExprMutator {
       }
     }
 
-    auto body = Downcast<Function>(DeviceAwareExprMutator::DeviceAwareVisitExpr_(func_node));
+    auto body = Downcast<Function>(ExprMutator::VisitExpr_(func_node));
 
     // When performing this optimization there are two cases.
     //
@@ -171,9 +168,8 @@ class LambdaLifter : public transform::DeviceAwareExprMutator {
     // The "inner" function should be used to generate the
     // code for the closure.
     Function lifted_func;
-    if (captured_vars.empty() && free_type_vars.empty()) {
-      lifted_func = Function(body->params, body->body, body->ret_type, body->type_params,
-                             body->attrs, body->span);
+    if (captured_vars.size() == 0 && free_type_vars.size() == 0) {
+      lifted_func = Function(body->params, body->body, body->ret_type, body->type_params);
     } else {
       // When a closure is locally bound in a program, we have its full type information
       // avalible to us.
@@ -187,16 +183,13 @@ class LambdaLifter : public transform::DeviceAwareExprMutator {
       // bind to go from unannotated free variables -> annotated free variables and then
       // construct the "closure" function with fully annotated arguments, no longer relying
       // on type inference.
-      size_t before_arity = body->params.size();
+      auto before = Downcast<Function>(body)->params.size();
       auto rebound_body = Function(func->params, Bind(body->body, rebinding_map), func->ret_type,
                                    func->type_params, func->attrs, func->span);
-      size_t after_arity = rebound_body->params.size();
-      CHECK_EQ(before_arity, after_arity);
+      auto after = Downcast<Function>(rebound_body)->params.size();
+      CHECK_EQ(before, after);
       lifted_func =
-          Function(typed_captured_vars, rebound_body, /*ret_type=*/func->func_type_annotation(),
-                   free_type_vars, /*attrs=*/{}, func->span);
-      lifted_func =
-          MaybeFunctionOnDevice(lifted_func, captured_var_device_types, result_device_type);
+          Function(typed_captured_vars, rebound_body, func->func_type_annotation(), free_type_vars);
       lifted_func = MarkClosure(lifted_func);
     }
 
@@ -213,7 +206,7 @@ class LambdaLifter : public transform::DeviceAwareExprMutator {
       module_->Add(global, lifted_func);
     }
 
-    if (captured_vars.empty()) {
+    if (captured_vars.size() == 0) {
       return std::move(global);
     } else {
       // If we need to allocate a closure,
@@ -233,7 +226,9 @@ class LambdaLifter : public transform::DeviceAwareExprMutator {
       if (auto* n = pair.second.as<FunctionNode>()) {
         if (n->GetAttr<String>(attr::kCompiler).defined()) continue;
         auto func = GetRef<Function>(n);
-        module_->Add(pair.first, Downcast<Function>(Mutate(func)), /*update=*/true);
+        func = Function(func->params, VisitExpr(func->body), func->ret_type, func->type_params,
+                        func->attrs);
+        module_->Add(pair.first, func, true);
       }
     }
     return module_;

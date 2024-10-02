@@ -17,7 +17,6 @@
 # pylint: disable=too-many-locals,too-many-statements,too-many-branches,protected-access
 """API for graph traversing."""
 import threading
-import re
 
 import tvm
 from tvm import relay, autotvm
@@ -31,7 +30,7 @@ from .utils import has_multiple_inputs, is_boundary_node, is_skipped_node
 from .._base import OPT_OUT_OP
 
 
-def expr2graph(expr, target_ops, node_dict, node_list, tvm_target):
+def expr2graph(expr, target_ops, node_dict, node_list):
     """Convert relay expr to graph data structure
     and fetch workloads of target operators.
 
@@ -51,9 +50,6 @@ def expr2graph(expr, target_ops, node_dict, node_list, tvm_target):
         Each node will be stored as a dictionary in the format of
         {"op": str, "node": tvm.relay.expr, "inputs": [int], "types": [tvm.relay.Type],
          "name": str, "workloads": [tuple], "topi_op": [function]}
-
-    tvm_target : tvm.target
-        The TVM target object.
     """
     # TODO(@kevinthesun, @icemelon9): Currently graph tuning pass relies on the fact
     #   that # autotvm tasks == # ops. But this won't be true after having relay op
@@ -62,12 +58,12 @@ def expr2graph(expr, target_ops, node_dict, node_list, tvm_target):
     env.reset(target_ops)
     # pylint: disable=not-context-manager
     with env:
-        _expr2graph_impl(expr, target_ops, node_dict, node_list, tvm_target)
+        _expr2graph_impl(expr, target_ops, node_dict, node_list)
         task_pos = 0
         for node_entry in node_list:
             if node_entry["op"] in target_ops:
                 task_name, args = env.task_collection[task_pos]
-                task = autotvm.task.create(task_name, args, target=tvm_target)
+                task = autotvm.task.create(task_name, args, target="llvm")
                 node_entry["workloads"] = [task.workload]
                 node_entry["topi_op"] = [task_name]
                 task_pos += 1
@@ -81,18 +77,7 @@ def _infer_type(node):
     return entry if isinstance(node, relay.Function) else entry.body
 
 
-def _replace_device_with_tracing(target):
-    """This is to replace -device=XXX with -device=tracing in the tvm_target string.
-    It is a stand-along function for testability.
-    We need to have device=tracing in order to fetch the workloads, it is not used
-    for anything beyond that so it is safe to override the device here only."""
-    target = str(target)
-    if "-device" in target:
-        return re.sub("-device=[^\\-$]+", "-device=tracing ", target).strip(" ")
-    return target + " -device=tracing"
-
-
-def _expr2graph_impl(expr, target_ops, node_dict, node_list, tvm_target):
+def _expr2graph_impl(expr, target_ops, node_dict, node_list):
     """Implementation to convert relay expr to graph data structure"""
 
     def _traverse_expr(node):
@@ -142,10 +127,9 @@ def _expr2graph_impl(expr, target_ops, node_dict, node_list, tvm_target):
                     params.append(free_var)
                 call = relay.Call(node.op, params, node.attrs)
                 mod = tvm.IRModule.from_expr(relay.Function(params, call))
-                relay.backend.te_compiler.get().clear()
-                tracing_target = _replace_device_with_tracing(tvm_target)
+                relay.backend.compile_engine.get().clear()
                 build_thread = threading.Thread(
-                    target=relay.build, args=(mod, tracing_target, None, None)
+                    target=relay.build, args=(mod, "llvm -device=tracing", None, None)
                 )
                 build_thread.start()
                 build_thread.join()
@@ -155,7 +139,7 @@ def _expr2graph_impl(expr, target_ops, node_dict, node_list, tvm_target):
         elif isinstance(node, Function):
             # Ignore root node since it equals to input function expression
             if node != expr:
-                _expr2graph_impl(node, target_ops, node_dict, node_list, tvm_target)
+                _expr2graph_impl(node, target_ops, node_dict, node_list)
             return
         elif isinstance(node, TupleGetItem):
             in_node_idx = node_dict[node.tuple_value]

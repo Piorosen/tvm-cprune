@@ -778,18 +778,11 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
       p->Print(op->outer);
       p->stream << ", inner=";
       p->Print(op->inner);
-      if (op->factor.defined()) {
-        p->stream << ", factor=";
-        p->Print(op->factor);
-      } else {
-        p->stream << ", nparts=";
-        p->Print(op->nparts);
-      }
       p->stream << ')';
     })
     .set_dispatch<FuseNode>([](const ObjectRef& node, ReprPrinter* p) {
       auto* op = static_cast<const FuseNode*>(node.get());
-      p->stream << "fuse(";
+      p->stream << "split(";
       p->stream << "outer=";
       p->Print(op->outer);
       p->stream << ", inner=";

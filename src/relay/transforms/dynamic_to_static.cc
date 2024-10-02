@@ -45,15 +45,6 @@ class DynamicToStaticMutator : public MixedModeMutator {
            }
            return Expr(nullptr);
          }},
-        {Op::Get("dyn.squeeze"),
-         [this](const CallNode* call_node) {
-           auto args = PrepareArgs(call_node);
-           if (const ConstantNode* axis = args[1].as<ConstantNode>()) {
-             ICHECK_EQ(axis->data->ndim, 1);
-             return MakeSqueeze(call_node->args[0], ToVector(axis->data));
-           }
-           return Expr(nullptr);
-         }},
         {Op::Get("dyn.tile"),
          [this](const CallNode* call_node) {
            auto args = PrepareArgs(call_node);
@@ -115,20 +106,20 @@ class DynamicToStaticMutator : public MixedModeMutator {
            }
            return Expr(nullptr);
          }},
-        {Op::Get("dyn.image.resize2d"),
+        {Op::Get("dyn.image.resize"),
          [this](const CallNode* call_node) {
            auto args = PrepareArgs(call_node);
            if (const ConstantNode* size = args[1].as<ConstantNode>()) {
-             const Resize2DAttrs* param = call_node->attrs.as<Resize2DAttrs>();
+             const ResizeAttrs* param = call_node->attrs.as<ResizeAttrs>();
              ICHECK(param);
              auto size_int = ToVector(size->data);
              Array<PrimExpr> size_prim;
              for (size_t i = 0; i < size_int.size(); ++i) {
                size_prim.push_back(size_int[i]);
              }
-             return MakeResize2D(call_node->args[0], size_prim, param->layout, param->method,
-                                 param->coordinate_transformation_mode, param->rounding_method,
-                                 param->cubic_alpha, param->cubic_exclude, param->out_dtype);
+             return MakeResize(call_node->args[0], size_prim, param->layout, param->method,
+                               param->coordinate_transformation_mode, param->rounding_method,
+                               param->bicubic_alpha, param->bicubic_exclude, param->out_dtype);
            }
            return Expr(nullptr);
          }},

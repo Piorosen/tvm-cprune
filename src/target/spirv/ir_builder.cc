@@ -93,7 +93,6 @@ std::vector<uint32_t> IRBuilder::Finalize() {
   data.insert(data.end(), decorate_.begin(), decorate_.end());
   data.insert(data.end(), global_.begin(), global_.end());
   data.insert(data.end(), func_header_.begin(), func_header_.end());
-  data.insert(data.end(), function_scope_vars_.begin(), function_scope_vars_.end());
   data.insert(data.end(), function_.begin(), function_.end());
   return data;
 }
@@ -310,8 +309,11 @@ Value IRBuilder::NewFunction() { return NewValue(t_void_func_, kFunction); }
 void IRBuilder::CommitKernelFunction(const Value& func, const std::string& name) {
   ICHECK_EQ(func.flag, kFunction);
   ib_.Begin(spv::OpEntryPoint).AddSeq(spv::ExecutionModelGLCompute, func, name);
-  for (auto& it : built_in_tbl_) {
-    ib_.Add(it.second);
+  if (workgroup_id_.id != 0) {
+    ib_.Add(workgroup_id_);
+  }
+  if (local_id_.id != 0) {
+    ib_.Add(local_id_);
   }
   ib_.Commit(&entry_);
 }
@@ -348,88 +350,34 @@ Value IRBuilder::Allocate(const SType& value_type, uint32_t num_elems,
 }
 
 Value IRBuilder::GetWorkgroupID(uint32_t dim_index) {
-  std::string name = "blockIdx." + std::string(1, 'x' + dim_index);
-  return GetBuiltInValue(spv::BuiltInWorkgroupId, dim_index, name);
+  if (workgroup_id_.id == 0) {
+    SType vec3_type = this->GetSType(DataType::Int(32).with_lanes(3));
+    SType ptr_type = this->GetPointerType(vec3_type, spv::StorageClassInput);
+    workgroup_id_ = NewValue(ptr_type, kVectorPtr);
+    ib_.Begin(spv::OpVariable)
+        .AddSeq(ptr_type, workgroup_id_, spv::StorageClassInput)
+        .Commit(&global_);
+    this->Decorate(spv::OpDecorate, workgroup_id_, spv::DecorationBuiltIn, spv::BuiltInWorkgroupId);
+  }
+  SType pint_type = this->GetPointerType(t_int32_, spv::StorageClassInput);
+  Value ptr = this->MakeValue(spv::OpAccessChain, pint_type, workgroup_id_,
+                              IntImm(t_int32_, static_cast<int64_t>(dim_index)));
+  return this->MakeValue(spv::OpLoad, t_int32_, ptr);
 }
 
 Value IRBuilder::GetLocalID(uint32_t dim_index) {
-  std::string name = "threadIdx." + std::string(1, 'x' + dim_index);
-  return GetBuiltInValue(spv::BuiltInLocalInvocationId, dim_index, name);
-}
-
-Value IRBuilder::GetBuiltInValue(spv::BuiltIn built_in, uint32_t index, const std::string& name) {
-  // Returned cached value if it exists
-  {
-    auto it = built_in_values_tbl_.find({built_in, index});
-    if (it != built_in_values_tbl_.end()) {
-      return it->second;
-    }
+  if (local_id_.id == 0) {
+    SType vec3_type = this->GetSType(DataType::Int(32).with_lanes(3));
+    SType ptr_type = this->GetPointerType(vec3_type, spv::StorageClassInput);
+    local_id_ = NewValue(ptr_type, kVectorPtr);
+    ib_.Begin(spv::OpVariable).AddSeq(ptr_type, local_id_, spv::StorageClassInput).Commit(&global_);
+    this->Decorate(spv::OpDecorate, local_id_, spv::DecorationBuiltIn,
+                   spv::BuiltInLocalInvocationId);
   }
-
-  DataType data_type;
-  DataType global_arr_type;
-  switch (built_in) {
-    case spv::BuiltInLocalInvocationId:
-    case spv::BuiltInWorkgroupId:
-      data_type = DataType::Int(32);
-      global_arr_type = data_type.with_lanes(3);
-      break;
-
-    default:
-      LOG(FATAL) << "No data type defined for SPIR-V Built-In " << built_in;
-  }
-
-  // Look up the decorated array value at global scope.  If it doesn't
-  // exist already, declare it.
-  Value global_array;
-  {
-    auto it = built_in_tbl_.find(built_in);
-    if (it != built_in_tbl_.end()) {
-      global_array = it->second;
-    } else {
-      SType ptr_arr_type = this->GetPointerType(GetSType(global_arr_type), spv::StorageClassInput);
-      global_array = NewValue(ptr_arr_type, kVectorPtr);
-
-      ib_.Begin(spv::OpVariable)
-          .AddSeq(ptr_arr_type, global_array, spv::StorageClassInput)
-          .Commit(&global_);
-      this->Decorate(spv::OpDecorate, global_array, spv::DecorationBuiltIn, built_in);
-
-      switch (built_in) {
-        case spv::BuiltInLocalInvocationId:
-          SetName(global_array, "BuiltInLocalInvocationId");
-          break;
-        case spv::BuiltInWorkgroupId:
-          SetName(global_array, "BuiltInWorkgroupId");
-          break;
-
-        default:
-          break;
-      }
-
-      built_in_tbl_[built_in] = global_array;
-    }
-  }
-
-  // Declare the dereferenced value
-  SType data_stype = GetSType(data_type);
-  SType ptr_type = this->GetPointerType(data_stype, spv::StorageClassInput);
-  Value global_const_index = UIntImm(t_int32_, static_cast<int64_t>(index));
-
-  Value ptr = NewValue(ptr_type, kNormal);
-  ib_.Begin(spv::OpAccessChain)
-      .AddSeq(ptr_type, ptr, global_array, global_const_index)
-      .Commit(&function_scope_vars_);
-
-  Value output = NewValue(data_stype, kNormal);
-  ib_.Begin(spv::OpLoad).AddSeq(data_stype, output, ptr).Commit(&function_scope_vars_);
-  if (name.size()) {
-    SetName(output, name);
-  }
-
-  // Store to cache and return
-  built_in_values_tbl_[{built_in, index}] = output;
-  return output;
+  SType pint_type = this->GetPointerType(t_int32_, spv::StorageClassInput);
+  Value ptr = this->MakeValue(spv::OpAccessChain, pint_type, local_id_,
+                              UIntImm(t_int32_, static_cast<int64_t>(dim_index)));
+  return this->MakeValue(spv::OpLoad, t_int32_, ptr);
 }
 
 Value IRBuilder::GetConst_(const SType& dtype, const uint64_t* pvalue) {
@@ -518,7 +466,7 @@ void IRBuilder::AddCapabilityFor(const DataType& dtype) {
       ICHECK(spirv_support_.supports_int64)
           << "Vulkan target does not support Int64 capability.  "
           << "If your device supports 64-bit int operations, "
-          << "please either add -supports_int64=1 to the target, "
+          << "please either add -supports_float64=1 to the target, "
           << "or query all device parameters by adding -from_device=0.";
       capabilities_used_.insert(spv::CapabilityInt64);
     }
@@ -534,8 +482,8 @@ void IRBuilder::AddCapabilityFor(const DataType& dtype) {
     } else if (dtype.bits() == 64) {
       ICHECK(spirv_support_.supports_float64)
           << "Vulkan target does not support Float64 capability.  "
-          << "If your device supports 64-bit float operations, "
-          << "please either add -supports_float64=1 to the target, "
+          << "If your device supports 16-bit float operations, "
+          << "please either add -supports_float16=1 to the target, "
           << "or query all device parameters by adding -from_device=0.";
       capabilities_used_.insert(spv::CapabilityFloat64);
     }

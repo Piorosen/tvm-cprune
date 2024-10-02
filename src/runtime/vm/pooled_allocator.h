@@ -45,7 +45,7 @@ class PooledAllocator final : public Allocator {
   ~PooledAllocator() { ReleaseAll(); }
 
   Buffer Alloc(size_t nbytes, size_t alignment, DLDataType type_hint) override {
-    std::lock_guard<std::recursive_mutex> lock(mu_);
+    std::lock_guard<std::mutex> lock(mu_);
     size_t size = ((nbytes + page_size_ - 1) / page_size_) * page_size_;
     auto&& it = memory_pool_.find(size);
     if (it != memory_pool_.end() && !it->second.empty()) {
@@ -57,34 +57,26 @@ class PooledAllocator final : public Allocator {
     Buffer buf;
     buf.device = device_;
     buf.size = size;
-    try {
-      buf.data = DeviceAPI::Get(device_)->AllocDataSpace(device_, size, alignment, type_hint);
-    } catch (InternalError& err) {
-      LOG(WARNING) << "PooledAllocator got InternalError during allocation: " << err.message();
-      LOG(WARNING) << "Trying to release all unused memory and reallocate...";
-      ReleaseAll();
-      buf.data = DeviceAPI::Get(device_)->AllocDataSpace(device_, size, alignment, type_hint);
-    }
-
+    buf.data = DeviceAPI::Get(device_)->AllocDataSpace(device_, size, alignment, type_hint);
     used_memory_.fetch_add(size, std::memory_order_relaxed);
-    VLOG(1) << "allocate " << size << " B, used memory " << used_memory_ << " B";
+    DLOG(INFO) << "allocate " << size << " B, used memory " << used_memory_ << " B";
     return buf;
   }
 
   void Free(const Buffer& buffer) override {
-    std::lock_guard<std::recursive_mutex> lock(mu_);
+    std::lock_guard<std::mutex> lock(mu_);
     if (memory_pool_.find(buffer.size) == memory_pool_.end()) {
       memory_pool_.emplace(buffer.size, std::vector<Buffer>{});
     }
     memory_pool_.at(buffer.size).push_back(buffer);
-    VLOG(1) << "reclaim buffer " << buffer.size;
+    DLOG(INFO) << "reclaim buffer " << buffer.size;
   }
 
   size_t UsedMemory() const override { return used_memory_.load(std::memory_order_relaxed); }
 
  private:
   void ReleaseAll() {
-    std::lock_guard<std::recursive_mutex> lock(mu_);
+    std::lock_guard<std::mutex> lock(mu_);
     for (auto const& it : memory_pool_) {
       auto const& pool = it.second;
       for (auto const& buf : pool) {
@@ -93,14 +85,14 @@ class PooledAllocator final : public Allocator {
     }
     memory_pool_.clear();
     used_memory_ = 0;
-    VLOG(1) << "release all buffers";
+    DLOG(INFO) << "release all buffers";
   }
 
  private:
   size_t page_size_;
   std::atomic<size_t> used_memory_;
   std::unordered_map<size_t, std::vector<Buffer> > memory_pool_;
-  std::recursive_mutex mu_;
+  std::mutex mu_;
   Device device_;
 };
 

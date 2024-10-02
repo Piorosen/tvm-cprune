@@ -205,17 +205,8 @@ class TypeInferencer : private ExprFunctor<Type(const Expr&)>,
       this->EmitFatal(Diagnostic::Error(op->span) << "Cannot do type inference on global variables "
                                                   << "without a module");
     }
-    if (mod_->ContainGlobalVar(var->name_hint)) {
-      BaseFunc func = mod_->Lookup(var->name_hint);
-
-      if (func->IsInstance<FunctionNode>()) {
-        relay::Function relay_func = Downcast<Function>(func);
-        return relay_func->checked_type();
-      }
-    }
-    // Return op->checked_type if the module doesn't contain the GlobalVar or the function is a
-    // PrimFunc (we don't typecheck PrimFuncs)
-    return op->checked_type_;
+    relay::Function e = Downcast<Function>(mod_->Lookup(var));
+    return e->checked_type();
   }
 
   Type VisitExpr_(const ConstantNode* op) final { return op->tensor_type(); }
@@ -486,9 +477,8 @@ class TypeInferencer : private ExprFunctor<Type(const Expr&)>,
     if (type_args.size() > fn_ty_node->type_params.size()) {
       this->EmitFatal(Diagnostic::Error(call->span)
                       << "Incorrect number of type args in " << call->span << ": "
-                      << "Expected " << fn_ty_node->type_params.size() << " but got "
-                      << type_args.size() << " for call:\n"
-                      << PrettyPrint(GetRef<Call>(call)));
+                      << "Expected " << fn_ty_node->type_params.size() << "but got "
+                      << type_args.size());
     }
     for (size_t i = type_args.size(); i < fn_ty_node->type_params.size(); i++) {
       type_args.push_back(IncompleteType(TypeKind::kType));
@@ -666,7 +656,7 @@ class TypeInferencer::Resolver : public MixedModeMutator, PatternMutator {
     Type checked_type = solver_->Resolve(it->second.checked_type);
 
     if (checked_type.as<IncompleteTypeNode>() != nullptr) {
-      this->solver_->Emit(
+      this->solver_->diag_ctx_.Emit(
           Diagnostic::Error(op->span)
           << "The type inference pass was unable to infer a type for this expression.\n"
           << "This usually occurs when an operator call is under constrained in some way,"
@@ -825,8 +815,10 @@ Pass InferType() {
   auto pass_info = PassInfo(0, "InferType", {});
   return tvm::transform::CreateModulePass(
       [=](IRModule mod, const PassContext& pass_ctx) {
+        DLOG(INFO) << "tvm::relay::transform::InferType";
         // Execute the pass function and return a new module.
-        IRModule updated_mod = mod->ShallowCopy();
+        IRModule updated_mod =
+            IRModule(mod->functions, mod->type_definitions, mod->Imports(), mod->source_map);
 
         pass_ctx->diag_ctx = DiagnosticContext::Default(updated_mod);
 

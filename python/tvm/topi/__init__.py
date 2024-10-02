@@ -45,12 +45,10 @@ from .argwhere import *
 from .scan import *
 from .einsum import *
 from .unique import *
-from .searchsorted import *
 from . import generic
 from . import nn
 from . import x86
 from . import cuda
-from . import gpu
 from . import arm_cpu
 from . import mali
 from . import bifrost
@@ -62,7 +60,6 @@ from . import image
 from . import sparse
 from . import hls
 from . import random
-from . import hexagon
 
 # error reporting
 from .utils import InvalidShapeError

@@ -226,10 +226,7 @@ NetworkWithIDs ConstructNetwork(const IRModule& mod, const GlobalVar& var, const
 
 /*! \brief Attributes to store the compiler options for Ethos-N */
 struct EthosnCompilerConfigNode : public tvm::AttrsNode<EthosnCompilerConfigNode> {
-  String variant;
-  String sram_size;
-  String tops;
-  String ple_ratio;
+  int variant;
   bool strategy0;
   bool strategy1;
   bool strategy3;
@@ -243,21 +240,19 @@ struct EthosnCompilerConfigNode : public tvm::AttrsNode<EthosnCompilerConfigNode
   bool block_config_8x32;
   bool block_config_8x8;
   bool enable_intermediate_compression;
+#if _ETHOSN_API_VERSION_ == 2008
+  bool dump_debug_files;
+#endif
   bool disable_winograd;
   String debug_dir;
   String compiler_algorithm;
 
   TVM_DECLARE_ATTRS(EthosnCompilerConfigNode, "ext.attrs.EthosnCompilerConfigNode") {
-    TVM_ATTR_FIELD(variant).describe("See Ethos-N documentation.").set_default("Ethos-N77");
-    TVM_ATTR_FIELD(sram_size)
-        .describe("Optionally override the default sram size. See Ethos(TM)-N documentation.")
-        .set_default("0");
-    TVM_ATTR_FIELD(tops)
-        .describe("Valid values 1, 2, 4 and 8. See Ethos(TM)-N documentation.")
-        .set_default("1");
-    TVM_ATTR_FIELD(ple_ratio)
-        .describe("Valid values 2 and 4. See Ethos(TM)-N documentation.")
-        .set_default("2");
+    TVM_ATTR_FIELD(variant)
+        .describe(
+            "0 for Ethos-N77, 1 for Ethos-N57, 2 for Ethos-N37,"
+            " 3 for Ethos-N78. See Ethos-N documentation.")
+        .set_default(0);
     TVM_ATTR_FIELD(strategy0).set_default(true);
     TVM_ATTR_FIELD(strategy1).set_default(true);
     TVM_ATTR_FIELD(strategy3).set_default(true);
@@ -271,6 +266,9 @@ struct EthosnCompilerConfigNode : public tvm::AttrsNode<EthosnCompilerConfigNode
     TVM_ATTR_FIELD(block_config_8x32).set_default(true);
     TVM_ATTR_FIELD(block_config_8x8).set_default(true);
     TVM_ATTR_FIELD(enable_intermediate_compression).set_default(true);
+#if _ETHOSN_API_VERSION_ == 2008
+    TVM_ATTR_FIELD(dump_debug_files).set_default(false);
+#endif
     TVM_ATTR_FIELD(disable_winograd).set_default(false);
     TVM_ATTR_FIELD(debug_dir).set_default(".");
     TVM_ATTR_FIELD(compiler_algorithm).set_default("NonCascadingOnly");
@@ -294,22 +292,6 @@ class EthosnCompiler {
    * \return runtime_module An Ethos-N runtime module
    */
   static runtime::Module CreateRuntimeModule(const ObjectRef& ref);
-
-  /*!
-   * \brief Initialise the is-supported functionality of the Ethos-N support library
-   * with the target variant.
-   * \return Error object
-   */
-  static EthosnError SupportedSetup();
-
-  /*!
-   * \brief Return the is-supported API of the Support Library
-   * \return A reference to the API.
-   */
-  static std::unique_ptr<sl::SupportQueries>& GetSupported() {
-    ICHECK(m_Queries != nullptr);
-    return m_Queries;
-  }
 
  private:
   /*!
@@ -346,12 +328,6 @@ class EthosnCompiler {
    */
   static std::pair<std::vector<uint32_t>, std::vector<uint32_t>> GetInputOutputOrder(
       NetworkWithIDs network, const std::unique_ptr<sl::CompiledNetwork>& compiled_network);
-
-  /*!
-   * \brief Query interface used to determine if the Ethos-N hardware supports an operation
-   * with the supplied parameters.
-   */
-  static std::unique_ptr<sl::SupportQueries> m_Queries;
 };
 
 runtime::Module CompileEthosn(const ObjectRef& ref) {

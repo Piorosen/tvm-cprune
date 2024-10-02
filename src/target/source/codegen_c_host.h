@@ -35,14 +35,12 @@
 namespace tvm {
 namespace codegen {
 
-class CodeGenCHost : public CodeGenC {
+class CodeGenCHost final : public CodeGenC {
  public:
   CodeGenCHost();
   void Init(bool output_ssa, bool emit_asserts, std::string target_str);
 
   void AddFunction(const PrimFunc& f);
-
-  void DefineModuleName();
 
   /*! \brief Add linked parameters, if they are present. */
   void DeclareParameters(Map<String, LinkedParam> params);

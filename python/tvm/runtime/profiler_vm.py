@@ -22,9 +22,7 @@ Provides extra APIs for profiling vm execution.
 """
 import warnings
 from tvm.runtime import _ffi_api
-from tvm.rpc import base as rpc_base
 from . import vm
-from .profiling import Report
 
 
 def enabled():
@@ -37,18 +35,10 @@ class VirtualMachineProfiler(vm.VirtualMachine):
 
     def __init__(self, exe, device, memory_cfg=None):
         super(VirtualMachineProfiler, self).__init__(exe, device, memory_cfg)
-
-        # Make sure the constructor of the VM module is on the proper device
-        # Remote devices have device_type of their actual device_type + RPC_SESS_MASK
-        if device.device_type >= rpc_base.RPC_SESS_MASK:
-            self.module = device._rpc_sess.get_function("runtime._VirtualMachineDebug")(exe)
-        else:
-            self.module = _ffi_api._VirtualMachineDebug(exe.module)
-
+        self.module = _ffi_api._VirtualMachineDebug(exe.module)
         self._init = self.module["init"]
         self._invoke = self.module["invoke"]
         self._profile = self.module["profile"]
-        self._profile_rpc = self.module["profile_rpc"]
         self._set_input = self.module["set_input"]
         self._setup_device(device, memory_cfg)
 
@@ -60,16 +50,13 @@ class VirtualMachineProfiler(vm.VirtualMachine):
         warnings.warn("get_stat has been removed, use profile instead")
         return ""
 
-    def profile(self, *args, func_name="main", collectors=None, **kwargs):
+    def profile(self, *args, func_name="main", **kwargs):
         """Profile a function call.
 
         Parameters
         ----------
         func_name : str
             The name of the function.
-
-        collectors : Optional[Sequence[MetricCollector]]
-            Extra metrics to collect. If profiling over RPC, collectors must be `None`.
 
         args : list[tvm.runtime.NDArray] or list[np.ndarray]
             The arguments to the function.
@@ -84,8 +71,4 @@ class VirtualMachineProfiler(vm.VirtualMachine):
         """
         if args or kwargs:
             self.set_input(func_name, *args, **kwargs)
-        if self.module.type_key == "rpc":
-            # We cannot serialize MetricCollectors over RPC
-            assert collectors is None, "Profiling with collectors is not supported over RPC"
-            return Report.from_json(self._profile_rpc(func_name))
-        return self._profile(func_name, collectors)
+        return self._profile(func_name)

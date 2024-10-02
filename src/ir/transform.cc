@@ -24,6 +24,7 @@
 #include <dmlc/thread_local.h>
 #include <tvm/ir/transform.h>
 #include <tvm/node/repr_printer.h>
+#include <tvm/runtime/container.h>
 #include <tvm/runtime/device_api.h>
 #include <tvm/runtime/registry.h>
 
@@ -145,16 +146,6 @@ class PassConfigManager {
     }
   }
 
-  Map<String, Map<String, String>> ListConfigs() {
-    Map<String, Map<String, String>> configs;
-    for (const auto& kv : key2vtype_) {
-      Map<String, String> metadata;
-      metadata.Set("type", kv.second.type_key);
-      configs.Set(kv.first, metadata);
-    }
-    return configs;
-  }
-
   static PassConfigManager* Global() {
     static auto* inst = new PassConfigManager();
     return inst;
@@ -171,10 +162,6 @@ class PassConfigManager {
 
 void PassContext::RegisterConfigOption(const char* key, uint32_t value_type_index) {
   PassConfigManager::Global()->Register(key, value_type_index);
-}
-
-Map<String, Map<String, String>> PassContext::ListConfigs() {
-  return PassConfigManager::Global()->ListConfigs();
 }
 
 PassContext PassContext::Create() { return PassContext(make_object<PassContextNode>()); }
@@ -409,9 +396,8 @@ IRModule ModulePassNode::operator()(IRModule mod, const PassContext& pass_ctx) c
   const PassInfo& pass_info = Info();
   ICHECK(mod.defined()) << "The input module must be set.";
 
-  VLOG_CONTEXT << pass_info->name;
-  VLOG(0) << "Executing module pass with opt level: " << pass_info->opt_level;
-  VLOG(1) << "Input module:" << std::endl << PrettyPrint(mod);
+  DLOG(INFO) << "Executing module pass : " << pass_info->name
+             << " with opt level: " << pass_info->opt_level;
 
   mod = pass_func(std::move(mod), pass_ctx);
 
@@ -422,8 +408,6 @@ IRModule ModulePassNode::operator()(IRModule mod, const PassContext& pass_ctx) c
 
   pass_ctx->diag_ctx.value().Render();
   pass_ctx->diag_ctx = previous;
-
-  VLOG(1) << "Result module:" << std::endl << PrettyPrint(mod);
 
   return mod;
 }
@@ -438,7 +422,7 @@ Sequential::Sequential(tvm::Array<Pass> passes, PassInfo pass_info) {
 Sequential::Sequential(tvm::Array<Pass> passes, String name) {
   auto n = make_object<SequentialNode>();
   n->passes = std::move(passes);
-  PassInfo pass_info = PassInfo(0, std::move(name), {});
+  PassInfo pass_info = PassInfo(2, std::move(name), {});
   n->pass_info = std::move(pass_info);
   data_ = std::move(n);
 }
@@ -469,17 +453,14 @@ Pass GetPass(const String& pass_name) {
   return (*f)();
 }
 
-// TODO(zhiics): we currently only sequentially execute each pass in
+// TODO(zhiics): we currenlty only sequentially execute each pass in
 // a Sequential without the consideration of their orders. The phase
 // ordering problem needs to be handled in the future.
 IRModule SequentialNode::operator()(IRModule mod, const PassContext& pass_ctx) const {
   for (const Pass& pass : passes) {
     ICHECK(pass.defined()) << "Found undefined pass for optimization.";
     const PassInfo& pass_info = pass->Info();
-    if (!pass_ctx.PassEnabled(pass_info)) {
-      VLOG(0) << "skipping disabled pass '" << pass_info->name << "'";
-      continue;
-    }
+    if (!pass_ctx.PassEnabled(pass_info)) continue;
     // resolve dependencies
     for (const auto& it : pass_info->required) {
       mod = GetPass(it)(std::move(mod), pass_ctx);
@@ -626,8 +607,6 @@ Pass PrintIR(String header, bool show_meta_data) {
 }
 
 TVM_REGISTER_GLOBAL("transform.PrintIR").set_body_typed(PrintIR);
-
-TVM_REGISTER_GLOBAL("transform.ListConfigs").set_body_typed(PassContext::ListConfigs);
 
 }  // namespace transform
 }  // namespace tvm

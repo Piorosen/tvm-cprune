@@ -19,4 +19,3 @@
 # transformation passes
 from .transform import *
 from .recast import recast
-from . import fake_quantization_to_integer, mixed_precision

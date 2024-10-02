@@ -242,10 +242,10 @@ void ReportAt(const DiagnosticContext& context, std::ostream& out, const Span& s
   }
 
   auto source = (*it).second;
-  VLOG(1) << "Source: " << std::endl << source->source;
+  DLOG(INFO) << "Source: " << std::endl << source->source;
 
-  VLOG(1) << "ReportAt "
-          << "span = " << span << " msg = " << diagnostic->message;
+  DLOG(INFO) << "ReportAt "
+             << "span = " << span << " msg = " << diagnostic->message;
 
   auto line_text = source.GetLine(span->line);
 

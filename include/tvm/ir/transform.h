@@ -60,8 +60,7 @@
 #include <tvm/ir/error.h>
 #include <tvm/ir/instrument.h>
 #include <tvm/ir/module.h>
-#include <tvm/runtime/container/array.h>
-#include <tvm/runtime/container/string.h>
+#include <tvm/runtime/container.h>
 #include <tvm/support/with.h>
 
 #include <string>
@@ -182,12 +181,6 @@ class PassContext : public ObjectRef {
    * \return The pass context.
    */
   TVM_DLL static PassContext Current();
-
-  /*!
-   * \brief Get all supported configuration names and metadata, registered within the PassContext.
-   * \return Map indexed by the config name, pointing to the metadata map as key-value
-   */
-  TVM_DLL static Map<String, Map<String, String>> ListConfigs();
 
   /*!
    * \brief Call instrument implementations' callbacks when entering PassContext.

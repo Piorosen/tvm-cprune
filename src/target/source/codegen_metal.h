@@ -35,7 +35,7 @@ namespace codegen {
 
 class CodeGenMetal final : public CodeGenC {
  public:
-  explicit CodeGenMetal(Target target);
+  CodeGenMetal();
   // override print thread tag.
   void PrintArgUnionDecl();
   void AddFunction(const PrimFunc& f);  // NOLINT(*)
@@ -58,7 +58,6 @@ class CodeGenMetal final : public CodeGenC {
 
  private:
   int thread_index_bits_{32};
-  Target target_;
 };
 }  // namespace codegen
 }  // namespace tvm

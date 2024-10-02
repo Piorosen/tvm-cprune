@@ -43,9 +43,8 @@
 
 #include "../../../runtime/vm/naive_allocator.h"
 #include "../../../runtime/vm/profiler/vm.h"
+#include "../../backend/compile_engine.h"
 #include "../../transforms/pass_utils.h"
-#include "../te_compiler.h"
-#include "../te_compiler_cache.h"
 
 namespace tvm {
 namespace relay {
@@ -62,6 +61,8 @@ using TagNameMap = std::unordered_map<size_t, tvm::relay::Constructor>;
 using GlobalMap = NodeMap<GlobalVar, Index>;
 using ConstMap = NodeMap<Constant, Index>;
 using ConstTensorShapeMap = NodeMap<TensorType, std::pair<Index, NDArray>>;
+using TargetsMap = Map<tvm::Integer, tvm::Target>;
+using ExprDeviceMap = std::unordered_map<Expr, Device, ObjectPtrHash, ObjectPtrEqual>;
 
 struct VMCompilerContext {
   // The module context for the compilation
@@ -74,14 +75,12 @@ struct VMCompilerContext {
   TagMap tag_map;
   // Map from global var to a unique integer
   GlobalMap global_map;
-  // TEcompiler for lowering
-  tec::TECompiler compiler;
   // List of constants
   std::vector<NDArray> constants;
   // Device type for constants
   std::vector<Index> const_device_type;
   // List of cached functions
-  std::vector<tec::CachedFunc> cached_funcs;
+  std::vector<CachedFunc> cached_funcs;
   // The functions that have been lowered.
   std::unordered_map<tir::PrimFunc, size_t, ObjectPtrHash, ObjectPtrEqual> seen_funcs;
 };
@@ -106,11 +105,11 @@ class VMCompiler : public runtime::ModuleNode {
    * \brief Lower the functions in a Module
    *
    * \param mod Relay Module
-   * \param targets For heterogeneous compilation, it is a dictionary indicating device type
-   *                to target mapping. For homogeneous compilation, it is a singleton build target.
+   * \param targets For heterogeneous compilation, it is a dictionary indicating context
+   *                to target mapping. For homogeneous compilation, it is a build target.
    * \param target_host Host compilation target, if target is device.
    */
-  void Lower(IRModule mod, const TargetMap& targets, const tvm::Target& target_host);
+  void Lower(IRModule mod, const TargetsMap& targets, const tvm::Target& target_host);
 
   /*! \brief Generate the machine code for lowered functions. */
   void Codegen();
@@ -120,13 +119,13 @@ class VMCompiler : public runtime::ModuleNode {
    * \brief Perform a series of optimizations on the input IR module.
    *
    * \param mod The input IRModule.
-   * \param targets For heterogeneous compilation, it is a dictionary indicating device type
-   *                to target mapping. For homogeneous compilation, it is a singleton build target.
+   * \param targets For heterogeneous compilation, it is a dictionary indicating context
+   *                to target mapping. For homogeneous compilation, it is a build target.
    * \param target_host Host compilation target.
    *
    * \return The optimized IRModule.
    */
-  IRModule OptimizeModule(IRModule mod, const TargetMap& targets, const Target& target_host);
+  IRModule OptimizeModule(IRModule mod, const TargetsMap& targets, const Target& target_host);
 
   /*!
    * \brief Populate the global function names in a map where the value is used
@@ -134,9 +133,12 @@ class VMCompiler : public runtime::ModuleNode {
    */
   void PopulateGlobalMap();
 
+  /*! \brief Analyze the device context of each expression. */
+  ExprDeviceMap AnalyzeContext() const;
+
  protected:
   /*! \brief Target devices. */
-  TargetMap targets_;
+  TargetsMap targets_;
   /*! \brief Target host device. */
   tvm::Target target_host_;
   /*! \brief Global shared meta data */

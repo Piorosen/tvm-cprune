@@ -25,26 +25,17 @@
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/function.h>
 #include <tvm/tir/op.h>
-#include <tvm/tir/schedule/instruction.h>
 #include <tvm/tir/schedule/schedule.h>
 #include <tvm/tir/schedule/state.h>
-#include <tvm/tir/schedule/trace.h>
 #include <tvm/tir/stmt_functor.h>
 
 #include <unordered_map>
 #include <utility>
 
-#include "../../arith/pattern_match.h"
-#include "../../node/attr_registry.h"
 #include "../../printer/text_printer.h"
 #include "../../runtime/thread_storage_scope.h"
-#include "../../support/array.h"
-#include "../../support/nd_int_set.h"
 #include "./analysis.h"
 #include "./error.h"
-#include "./instruction_traits.h"
-#include "./primitive.h"
-#include "./transform.h"
 
 namespace tvm {
 namespace tir {
@@ -53,8 +44,8 @@ namespace tir {
  * \brief A helper macro to convert an sref to the statement it points to,
  * then check if the downcasting succeeded.
  * \param Result The result variable, used for checking
- * \param SRef The SRef to be cast
- * \param Type The type to be cast to, can be Block or For
+ * \param SRef The SRef to be casted
+ * \param Type The type to be casted to, can be Block or For
  */
 #define TVM_SREF_AS_OR_ERR(Result, SRef, Type) \
   SRef->StmtAs<Type>();                        \
@@ -64,7 +55,7 @@ namespace tir {
  * \brief A helper macro to convert an sref to the block it points to,
  * throwing an internal error if downcasting fails
  * \param Result The result variable, used for checking
- * \param SRef The SRef to be cast
+ * \param SRef The SRef to be casted
  */
 #define TVM_SREF_TO_BLOCK(Result, SRef)                   \
   TVM_SREF_AS_OR_ERR(Result, SRef, ::tvm::tir::BlockNode) \
@@ -75,7 +66,7 @@ namespace tir {
  * \brief A helper macro to convert an sref to the for-loop it points to,
  * throwing an internal error if downcasting fails
  * \param Result The name of the result variable, used for checking
- * \param SRef The SRef to be cast
+ * \param SRef The SRef to be casted
  */
 #define TVM_SREF_TO_FOR(Result, SRef)                   \
   TVM_SREF_AS_OR_ERR(Result, SRef, ::tvm::tir::ForNode) \
@@ -86,8 +77,8 @@ namespace tir {
  * \brief Downcast a TVM ObjectRef to its corresponding container using `ObjectRef::as<Type>`,
  * then check if the downcasting succeeded.
  * \param Result The result variable, used for checking
- * \param From The ObjectRef to be downcast
- * \param Type The type to be downcast to
+ * \param From The ObjectRef to be downcasted
+ * \param Type The type to be downcasted to
  */
 #define TVM_TYPE_AS_OR_ERR(Result, From, Type) \
   From.as<Type>();                             \
@@ -97,28 +88,13 @@ namespace tir {
  * \brief Downcast a TVM ObjectRef to its corresponding container using `ObjectRef::as<Type>`,
  * throwing an internal error if downcast fails.
  * \param Result The result variable, used for checking
- * \param From The ObjectRef to be downcast
- * \param Type The type to be downcast to
+ * \param From The ObjectRef to be downcasted
+ * \param Type The type to be downcasted to
  */
 #define TVM_TYPE_AS(Result, From, Type)                                           \
   TVM_TYPE_AS_OR_ERR(Result, From, Type)                                          \
       << "TypeError: Expects `" << #From << "` to have type `" << Type::_type_key \
       << "`, but gets: " << (From.defined() ? From->GetTypeKey() : "None")
-
-/*!
- * \brief Convert an array of loop StmtSRefs to an array of loops
- * \param loop_srefs The loop StmtSRefs to be converted
- * \return The conversion result loops
- */
-inline Array<For> LoopSRefs2Loops(const Array<StmtSRef>& loop_srefs) {
-  Array<For> loops;
-  loops.reserve(loop_srefs.size());
-  for (StmtSRef loop_sref : loop_srefs) {
-    const ForNode* loop = TVM_SREF_TO_FOR(loop, loop_sref);
-    loops.push_back(GetRef<For>(loop));
-  }
-  return loops;
-}
 
 /******** Storage scope ********/
 
@@ -129,67 +105,13 @@ inline Array<For> LoopSRefs2Loops(const Array<StmtSRef>& loop_srefs) {
  * \param thread_scope The thread scope to be relaxed
  * \return A boolean indicating the result
  */
-inline bool CanRelaxStorageUnderThread(const runtime::StorageScope& storage_scope,
-                                       const runtime::ThreadScope& thread_scope) {
+inline bool CanRelaxStorageUndereThread(const runtime::StorageScope& storage_scope,
+                                        const runtime::ThreadScope& thread_scope) {
   if (storage_scope.rank == runtime::StorageRank::kWarp) {
     // for warp memory, we only relax threadIdx.x
     return thread_scope.rank == 1 && thread_scope.dim_index == 0;
   }
   return static_cast<int>(storage_scope.rank) <= static_cast<int>(thread_scope.rank);
-}
-
-/******** SeqStmt ********/
-
-/*!
- * \brief Remove a specific Stmt from a SeqStmt. If a SeqStmt contains a BlockRealize,
- * whose block is the Stmt to be removed, then remove that BlockRealize too.
- * \param seq The SeqStmt to be removed from
- * \param to_remove The Stmt to be removed
- * \return The removal result
- */
-inline Stmt RemoveFromSeqStmt(const SeqStmt& seq, const Stmt& to_remove) {
-  ICHECK_GT(seq->size(), 1);
-  Array<Stmt> new_stmts;
-  new_stmts.reserve(seq->size());
-  for (const Stmt& stmt : seq->seq) {
-    if (to_remove.same_as(stmt)) {
-      continue;
-    }
-    if (const auto* realize = stmt.as<BlockRealizeNode>()) {
-      if (to_remove.same_as(realize->block)) {
-        continue;
-      }
-    }
-    new_stmts.push_back(stmt);
-  }
-  return SeqStmt::Flatten(new_stmts);
-}
-
-/*!
- * \brief Convert a Stmt to an Array.
- * \param stmt The Stmt to be converted to
- * \return If the Stmt is SeqStmt, then returns the sequence;
- * Otherwise, returns a single-element Array with the Stmt inside.
- */
-inline Array<Stmt> AsArray(const Stmt& stmt) {
-  if (const auto* seq_stmt = stmt.as<SeqStmtNode>()) {
-    return seq_stmt->seq;
-  }
-  return {stmt};
-}
-
-/******** IterVar ********/
-
-/*!
- * \brief Create a new IterVar for the input For loop, with specified name and type
- * \param loop The loop to be created from
- * \param name The name of the new IterVar
- * \param iter_var_type The type of the new IterVar
- * \return The newly created IterVar
- */
-inline IterVar IterVarFromLoop(const For& loop, String name, IterVarType iter_var_type) {
-  return IterVar(Range::FromMinExtent(loop->min, loop->extent),
-                 Var(std::move(name), loop->loop_var.dtype()), iter_var_type);
 }
 
 /******** Integer set ********/
@@ -210,26 +132,20 @@ inline Map<Var, arith::IntSet> AsIntSet(const Map<Var, Range>& var_dom) {
   return {result.begin(), result.end()};
 }
 
-/**************** Loop extents ****************/
-
 /*!
- * \brief Get the extents of a loop
- * \param loop The loop to be queried
- * \return The extents of the loop
+ * \brief Converts an N-dimensional integer set to N-dimensional region
+ * \param nd_int_set The integer set
+ * \return The region as the result of conversion
  */
-inline int64_t GetLoopIntExtent(const ForNode* loop) {
-  const auto* int_extent = loop->extent.as<IntImmNode>();
-  return int_extent ? int_extent->value : -1;
-}
-
-/*!
- * \brief Get the extents of a loop
- * \param loop_sref The loop to be queried
- * \return The extents of the loop
- */
-inline int64_t GetLoopIntExtent(const StmtSRef& loop_sref) {
-  const ForNode* loop = TVM_SREF_TO_FOR(loop, loop_sref);
-  return GetLoopIntExtent(loop);
+inline Array<Range> AsRegion(const Array<arith::IntSet>& nd_int_set, arith::Analyzer* analyzer) {
+  Array<Range> result;
+  result.reserve(nd_int_set.size());
+  for (const arith::IntSet& int_set : nd_int_set) {
+    PrimExpr min = analyzer->Simplify(int_set.min());
+    PrimExpr extent = analyzer->Simplify(int_set.max() - int_set.min() + 1);
+    result.push_back(Range::FromMinExtent(std::move(min), std::move(extent)));
+  }
+  return result;
 }
 
 }  // namespace tir

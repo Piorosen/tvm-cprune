@@ -18,7 +18,7 @@
  */
 
 /*!
- * \file src/relay/op/nn/convolution_make.h
+ * \file src/relay/op/nn/make_convolution.h
  * \brief utilities for creating convolution ops
  */
 #ifndef TVM_RELAY_OP_NN_CONVOLUTION_MAKE_H_

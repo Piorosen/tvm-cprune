@@ -20,11 +20,17 @@ from tvm import topi
 from tvm.auto_scheduler import is_auto_scheduler_enabled
 from tvm.te import SpecializedCondition
 from tvm.contrib.thrust import can_use_rocthrust
-from tvm.contrib import miopen
 
 from .generic import *
 from .. import op as _op
 from .cuda import judge_winograd, naive_schedule
+
+
+@schedule_lrn.register("rocm")
+def schedule_lrn_rocm(attrs, outs, target):
+    """schedule LRN for rocm"""
+    with target:
+        return topi.rocm.schedule_lrn(outs)
 
 
 @conv2d_strategy.register("rocm")
@@ -69,9 +75,9 @@ def conv2d_strategy_rocm(attrs, inputs, out_type, target):
         elif layout == "NHWC":
             assert kernel_layout == "HWIO"
             strategy.add_implementation(
-                wrap_compute_conv2d(topi.gpu.conv2d_nhwc),
-                wrap_topi_schedule(topi.gpu.schedule_conv2d_nhwc),
-                name="conv2d_nhwc.gpu",
+                wrap_compute_conv2d(topi.cuda.conv2d_nhwc),
+                wrap_topi_schedule(topi.cuda.schedule_conv2d_nhwc),
+                name="conv2d_nhwc.cuda",
             )
             N, H, W, _ = get_const_tuple(data.shape)
             KH, KW, CI, CO = get_const_tuple(kernel.shape)
@@ -295,44 +301,6 @@ def topk_strategy_cuda(attrs, inputs, out_type, target):
             wrap_compute_topk(topi.cuda.topk_thrust),
             wrap_topi_schedule(topi.cuda.schedule_topk),
             name="topk_thrust.rocm",
-            plevel=15,
-        )
-    return strategy
-
-
-@softmax_strategy.register(["rocm"])
-def softmax_strategy_rocm(attrs, inputs, out_type, target):
-    """rocm strategy for softmax"""
-    strategy = _op.OpStrategy()
-    strategy.add_implementation(
-        wrap_compute_softmax(topi.nn.softmax),
-        wrap_topi_schedule(topi.cuda.schedule_softmax),
-        name="softmax.rocm",
-    )
-    if "miopen" in target.libs:
-        strategy.add_implementation(
-            wrap_compute_softmax(miopen.softmax),
-            wrap_topi_schedule(topi.generic.schedule_extern),
-            name="softmax.miopen",
-            plevel=15,
-        )
-    return strategy
-
-
-@log_softmax_strategy.register(["rocm"])
-def log_softmax_strategy_rocm(attrs, inputs, out_type, target):
-    """rocm strategy for log softmax"""
-    strategy = _op.OpStrategy()
-    strategy.add_implementation(
-        wrap_compute_softmax(topi.nn.log_softmax),
-        wrap_topi_schedule(topi.cuda.schedule_softmax),
-        name="log_softmax.rocm",
-    )
-    if "miopen" in target.libs:
-        strategy.add_implementation(
-            wrap_compute_softmax(miopen.log_softmax),
-            wrap_topi_schedule(topi.generic.schedule_extern),
-            name="log_softmax.miopen",
             plevel=15,
         )
     return strategy

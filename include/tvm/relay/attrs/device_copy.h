@@ -35,7 +35,6 @@ namespace relay {
  * \brief Options for the device copy operators.
  */
 struct DeviceCopyAttrs : public tvm::AttrsNode<DeviceCopyAttrs> {
-  // TODO(mbs): Should be TargetDevice.
   int dst_dev_type;
   int src_dev_type;
 

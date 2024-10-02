@@ -26,6 +26,7 @@
 
 #include <tvm/ir/module.h>
 #include <tvm/relay/expr.h>
+#include <tvm/runtime/container.h>
 
 #include <bitset>
 #include <string>

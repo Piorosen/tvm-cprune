@@ -35,13 +35,12 @@ namespace tvm {
 namespace relay {
 
 template <typename T>
-InferCorrectLayoutOutput UpsamplingInferCorrectLayout(const Attrs& attrs,
-                                                      const Array<Layout>& new_in_layouts,
-                                                      const Array<Layout>& old_in_layouts,
-                                                      const Array<tvm::relay::Type>& old_in_types) {
-  const auto* attrs_ptr = attrs.as<T>();
-  ICHECK(attrs_ptr);
-  ObjectPtr<T> params = make_object<T>(*attrs_ptr);
+Array<Array<Layout> > UpsamplingInferCorrectLayout(const Attrs& attrs,
+                                                   const Array<Layout>& new_in_layouts,
+                                                   const Array<Layout>& old_in_layouts,
+                                                   const Array<tvm::relay::Type>& old_in_types) {
+  // NOTE: Discard "const" qualifier here.
+  T* params = const_cast<T*>(attrs.as<T>());
 
   if (new_in_layouts.defined()) {
     ICHECK_EQ(new_in_layouts.size(), 1);
@@ -58,7 +57,8 @@ InferCorrectLayoutOutput UpsamplingInferCorrectLayout(const Attrs& attrs,
     }
   }
 
-  return InferCorrectLayoutOutput({params->layout}, {params->layout}, Attrs(params));
+  Layout inferred_layout(params->layout);
+  return Array<Array<Layout> >{{inferred_layout}, {inferred_layout}};
 }
 
 }  // namespace relay

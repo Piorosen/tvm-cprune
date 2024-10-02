@@ -40,14 +40,14 @@ class OpenCLWrappedFunc {
   // initialize the OpenCL function.
   void Init(OpenCLModuleNode* m, ObjectPtr<Object> sptr, OpenCLModuleNode::KTRefEntry entry,
             std::string func_name, std::vector<size_t> arg_size,
-            const std::vector<std::string>& launch_param_tags) {
+            const std::vector<std::string>& thread_axis_tags) {
     w_ = m->GetGlobalWorkspace();
     m_ = m;
     sptr_ = sptr;
     entry_ = entry;
     func_name_ = func_name;
     arg_size_ = arg_size;
-    launch_param_config_.Init(arg_size.size(), launch_param_tags);
+    thread_axis_cfg_.Init(arg_size.size(), thread_axis_tags);
   }
   // invoke the function with void arguments
   void operator()(TVMArgs args, TVMRetValue* rv, void** void_args) const {
@@ -64,17 +64,11 @@ class OpenCLWrappedFunc {
     }
     // setup arguments.
     for (cl_uint i = 0; i < arg_size_.size(); ++i) {
-      void* arg = nullptr;
-      if (args.type_codes[i] == DLDataTypeCode::kDLOpaqueHandle) {
-        arg = static_cast<cl::BufferDescriptor*>(void_args[i])->buffer;
-      } else {
-        arg = void_args[i];
-      }
-      OPENCL_CALL(clSetKernelArg(kernel, i, arg_size_[i], arg));
+      OPENCL_CALL(clSetKernelArg(kernel, i, arg_size_[i], void_args[i]));
     }
     cl_command_queue queue = w_->GetQueue(t->device);
-    ThreadWorkLoad wl = launch_param_config_.Extract(args);
-    cl_uint work_dim = static_cast<cl_uint>(launch_param_config_.work_dim());
+    ThreadWorkLoad wl = thread_axis_cfg_.Extract(args);
+    cl_uint work_dim = static_cast<cl_uint>(thread_axis_cfg_.work_dim());
     for (cl_uint i = 0; i < work_dim; ++i) {
       wl.work_size[i] *= wl.work_size[i + 3];
     }
@@ -96,8 +90,8 @@ class OpenCLWrappedFunc {
   std::string func_name_;
   // convert code for void argument
   std::vector<size_t> arg_size_;
-  // launch parameters config
-  LaunchParamConfig launch_param_config_;
+  // thread axis config
+  ThreadAxisConfig thread_axis_cfg_;
 };
 
 OpenCLModuleNode::~OpenCLModuleNode() {
@@ -148,7 +142,7 @@ PackedFunc OpenCLModuleNode::GetFunction(const std::string& name,
     }
   }
   // initialize the wrapped func.
-  f.Init(this, sptr_to_self, kid_map_.at(name), name, arg_size, info.launch_param_tags);
+  f.Init(this, sptr_to_self, kid_map_.at(name), name, arg_size, info.thread_axis_tags);
   return PackFuncVoidAddr(f, info.arg_types);
 }
 
@@ -198,8 +192,8 @@ void OpenCLModuleNode::Init() {
   ICHECK(!parsed_kernels_.empty()) << "The OpenCL module expects a kernel delimited "
                                    << "source from code generation, but no kernel "
                                    << "delimiter was found.";
-  ICHECK_EQ(fmap_.size(), parsed_kernels_.size())
-      << "The number of parsed kernel sources does not match the number of kernel functions";
+  ICHECK_EQ(workspace_->num_registered_kernels, parsed_kernels_.size())
+      << "The number of registered kernels does not match number of parsed kernel sources";
   // zero initialize cl_program pointers for each device kernel
   for (auto& kv : parsed_kernels_) {
     programs_.insert({kv.first, std::vector<cl_program>(workspace_->devices.size(), nullptr)});

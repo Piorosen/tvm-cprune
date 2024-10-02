@@ -31,8 +31,6 @@
 
 #include <stack>
 
-#include "../op/annotation/annotation.h"
-
 namespace tvm {
 namespace relay {
 MixedModeVisitor::MixedModeVisitor(int visit_limit) {
@@ -529,19 +527,15 @@ Expr Bind(const Expr& expr, const tvm::Map<Var, Expr>& args_map) {
   if (const FunctionNode* func = expr.as<FunctionNode>()) {
     Expr new_body = ExprBinder(args_map).VisitExpr(func->body);
     Array<Var> new_params;
-    std::vector<DLDeviceType> new_param_device_types;
-    for (size_t i = 0; i < func->params.size(); ++i) {
-      if (!args_map.count(func->params[i])) {
-        new_params.push_back(func->params[i]);
-        new_param_device_types.push_back(GetFunctionParamDeviceType(func, i));
+    for (Var param : func->params) {
+      if (!args_map.count(param)) {
+        new_params.push_back(param);
       }
     }
     if (new_body.same_as(func->body) && new_params.size() == func->params.size()) {
       return expr;
     }
-    auto ret =
-        Function(new_params, new_body, func->ret_type, func->type_params, func->attrs, func->span);
-    ret = MaybeFunctionOnDevice(ret, new_param_device_types, GetFunctionResultDeviceType(func));
+    auto ret = Function(new_params, new_body, func->ret_type, func->type_params, func->attrs);
     std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> set;
     for (const auto& v : FreeVars(expr)) {
       set.insert(v);
@@ -549,19 +543,9 @@ Expr Bind(const Expr& expr, const tvm::Map<Var, Expr>& args_map) {
     for (const auto& v : FreeVars(ret)) {
       if (set.count(v) == 0) {
         new_params.push_back(v);
-        if (GetFunctionResultDeviceType(func) != kInvalidDeviceType) {
-          // TODO(mbs): The function has been annotated with a device, which means we are supposed
-          // to be preserving device annotations on every transformation. However there's no
-          // such context for the free vars in args_map.
-          LOG(WARNING) << "introduced free var '" << PrettyPrint(v)
-                       << "' into function body but no device is known for it";
-        }
-        new_param_device_types.push_back(kInvalidDeviceType);
       }
     }
-    ret =
-        Function(new_params, new_body, func->ret_type, func->type_params, func->attrs, func->span);
-    ret = MaybeFunctionOnDevice(ret, new_param_device_types, GetFunctionResultDeviceType(func));
+    ret = Function(new_params, new_body, func->ret_type, func->type_params, func->attrs);
     ICHECK_EQ(FreeVars(expr).size(), FreeVars(ret).size());
     return std::move(ret);
   } else {

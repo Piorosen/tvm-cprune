@@ -21,8 +21,6 @@ Task can be constructed from tuple of func, args, and kwargs.
 func is a state-less function, or a string that
 registers the standard task.
 """
-import functools
-
 import numpy as np
 
 from tvm import runtime
@@ -40,11 +38,11 @@ from .space import ConfigSpace
 def _lookup_task(name):
     task = TASK_TABLE.get(name)
     if task is None:
-        # Unable to find the given task. This might be because we are
-        # creating a task based on a name that has not been imported.
-        # Rather than raising an exception here, we return a dummy
-        # task which cannot be invoked.
-        task = MissingTask(name)
+        raise RuntimeError(
+            f"Could not find a registered function for the task {name}. It is "
+            "possible that the function is registered in a python file which was "
+            "not imported in this run."
+        )
     return task
 
 
@@ -61,7 +59,7 @@ def serialize_args(args):
             return ("TENSOR", get_const_tuple(x.shape), x.dtype)
         if isinstance(x, (tuple, list, container.Array)):
             return tuple([_encode(a) for a in x])
-        if isinstance(x, (str, int, float, expr.Var, expr.Any)):
+        if isinstance(x, (str, int, float, np.int32, np.int16, np.float32, np.float16, np.float_, expr.Var, expr.Any)):
             return x
         if isinstance(x, (expr.StringImm, expr.IntImm, expr.FloatImm)):
             return x.value
@@ -264,25 +262,6 @@ class TaskTemplate(object):
         return inputs
 
 
-class MissingTask(TaskTemplate):
-    """
-    Dummy task template for a task lookup which cannot be resolved.
-    This can occur if the task being requested from _lookup_task()
-    has not been imported in this run.
-    """
-
-    def __init__(self, taskname: str):
-        super().__init__()
-        self._taskname = taskname
-
-    def __call__(self, *args, **kwargs):
-        raise RuntimeError(
-            f"Attempting to invoke a missing task {self._taskname}."
-            "It is possible that the function is registered in a "
-            "Python module that is not imported in this run, or the log is out-of-date."
-        )
-
-
 def _register_task_compute(name, func=None):
     """Register compute function to autotvm task
 
@@ -432,7 +411,6 @@ def template(task_name, func=None):
     """
 
     def _decorate(f):
-        @functools.wraps(f)
         def wrapper(*args, **kwargs):
             assert not kwargs, "Do not support kwargs in template function call"
             workload = args_to_workload(args, task_name)

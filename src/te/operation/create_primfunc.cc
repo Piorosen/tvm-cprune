@@ -22,7 +22,6 @@
 #include <tvm/tir/stmt_functor.h>
 
 #include <algorithm>
-#include <unordered_set>
 
 #include "../schedule/graph.h"
 
@@ -36,12 +35,11 @@ class ProducerToBufferTransformer : public StmtExprMutator {
       : tensor2buffers_(tensor2buffers) {}
 
   PrimExpr VisitExpr_(const ProducerLoadNode* op) final {
-    auto visited_op = Downcast<ProducerLoad>(StmtExprMutator::VisitExpr_(op));
-    te::Tensor tensor = Downcast<te::Tensor>(visited_op->producer);
+    te::Tensor tensor = Downcast<te::Tensor>(op->producer);
     auto it = tensor2buffers_.find(tensor);
     ICHECK(it != tensor2buffers_.end()) << "IndexError: Cannot find the tensor " << tensor;
     const Buffer& buffer = it->second;
-    return BufferLoad(buffer, visited_op->indices);
+    return BufferLoad(buffer, op->indices);
   }
 
  private:
@@ -49,7 +47,7 @@ class ProducerToBufferTransformer : public StmtExprMutator {
   const std::unordered_map<te::Tensor, Buffer>& tensor2buffers_;
 };
 
-/*! \brief Helper data structure to store information. */
+/*! \brief Helper data structural to store informations. */
 struct CreateFuncInfo {
   /*! \brief The Tensor arg_list. */
   Array<te::Tensor> arg_list;
@@ -104,7 +102,7 @@ BlockRealize GenerateBlockFromTensor(const te::ComputeOp& compute_op, const te::
   f_push_block_vars(compute_op->reduce_axis);
 
   // Step 2. Declare buffer and update op2buffers
-  Buffer buffer = decl_buffer(tensor->shape, tensor->dtype, tensor->GetNameHint(), "global");
+  Buffer buffer = decl_buffer(tensor->shape, tensor->dtype, tensor->GetNameHint());
   info->tensor2buffers[tensor] = buffer;
 
   // Step 3. Add Buffer to root_alloc
@@ -265,8 +263,7 @@ PrimFunc CreatePrimFunc(const Array<te::Tensor>& arg_list) {
       const te::Tensor& tensor = op.output(0);
       // Check op is in op list
       ICHECK(info.IsArg(tensor));
-      const Buffer& buffer =
-          decl_buffer(placeholder->shape, placeholder->dtype, placeholder->name, "global");
+      const Buffer& buffer = decl_buffer(placeholder->shape, placeholder->dtype, placeholder->name);
       info.tensor2buffers[tensor] = buffer;
     } else if (const auto* compute_op = op.as<te::ComputeOpNode>()) {
       // Case 2. ComputeOp (te.compute)
@@ -301,40 +298,9 @@ PrimFunc CreatePrimFunc(const Array<te::Tensor>& arg_list) {
   return (*complete)(func, info.root_alloc);
 }  // namespace tir
 
-PrimFunc CreatePrimFuncFromOutputs(const Array<te::Tensor>& outputs) {
-  std::vector<te::Tensor> stack;
-  std::unordered_set<const te::TensorNode*> visited;
-  for (const te::Tensor& output : outputs) {
-    if (!visited.count(output.get())) {
-      visited.insert(output.get());
-      stack.push_back(output);
-    }
-  }
-
-  Array<te::Tensor> arg_list;
-  while (!stack.empty()) {
-    te::Tensor tensor = stack.back();
-    stack.pop_back();
-    if (tensor->op->IsInstance<te::PlaceholderOpNode>()) {
-      arg_list.push_back(tensor);
-    } else if (tensor->op->IsInstance<te::ComputeOpNode>()) {
-      Array<te::Tensor> inputs = tensor->op->InputTensors();
-      for (const te::Tensor& input : inputs) {
-        if (!visited.count(input.get())) {
-          visited.insert(input.get());
-          stack.push_back(input);
-        }
-      }
-    }
-  }
-  for (const te::Tensor& output : outputs) {
-    arg_list.push_back(output);
-  }
-  return CreatePrimFunc(arg_list);
-}
-
-TVM_REGISTER_GLOBAL("te.CreatePrimFunc").set_body_typed(CreatePrimFunc);
-TVM_REGISTER_GLOBAL("te.CreatePrimFuncFromOutputs").set_body_typed(CreatePrimFuncFromOutputs);
+TVM_REGISTER_GLOBAL("te.CreatePrimFunc").set_body_typed([](const Array<te::Tensor>& tensors) {
+  return CreatePrimFunc(tensors);
+});
 
 }  // namespace tir
 }  // namespace tvm

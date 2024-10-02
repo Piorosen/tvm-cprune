@@ -37,12 +37,13 @@ namespace relay {
 // relay.nn.correlation
 TVM_REGISTER_NODE_TYPE(CorrelationAttrs);
 
-InferCorrectLayoutOutput CorrelationInferCorrectLayout(
-    const Attrs& attrs, const Array<Layout>& new_in_layouts, const Array<Layout>& old_in_layouts,
-    const Array<tvm::relay::Type>& old_in_types) {
+Array<Array<Layout>> CorrelationInferCorrectLayout(const Attrs& attrs,
+                                                   const Array<Layout>& new_in_layouts,
+                                                   const Array<Layout>& old_in_layouts,
+                                                   const Array<tvm::relay::Type>& old_in_types) {
   const auto* params = attrs.as<CorrelationAttrs>();
   Layout layout{params->layout};
-  return InferCorrectLayoutOutput({layout, layout}, {layout}, attrs);
+  return Array<Array<Layout>>{{layout, layout}, {layout}};
 }
 
 // Positional relay function to create correlation operator

@@ -45,12 +45,11 @@
 #include <vector>
 
 #include "../../../target/source/codegen_source_base.h"
-#include "../../op/annotation/annotation.h"
+#include "../../backend/compile_engine.h"
 #include "../../op/op_common.h"
-#include "../../transforms/device_aware_visitors.h"
 #include "../../transforms/pass_utils.h"
 #include "../utils.h"
-#include "./compiler.h"
+#include "compiler.h"
 
 namespace tvm {
 namespace relay {
@@ -248,14 +247,16 @@ int GetFallbackDevice() {
   return fallback_dev->value;
 }
 
-class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
+class VMFunctionCompiler : ExprFunctor<void(const Expr& expr)> {
  public:
-  VMFunctionCompiler(VMCompilerContext* context, TargetMap targets, Target target_host)
-      : DeviceAwareExprFunctor(context->module),
-        last_register_(0),
+  VMFunctionCompiler(VMCompilerContext* context, TargetsMap targets, Target target_host,
+                     ExprDeviceMap expr_device_map)
+      : last_register_(0),
         registers_num_(0),
+        engine_(CompileEngine::Global()),
         context_(context),
-        target_host_(target_host) {
+        target_host_(target_host),
+        expr_device_map_(std::move(expr_device_map)) {
     CheckAndUpdateHostConsistency(&targets, &target_host);
     for (const auto& it : targets) {
       targets_[it.first->value] = it.second;
@@ -264,54 +265,44 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
   }
 
   VMFunction Compile(const GlobalVar& var, const Function& func) {
-    std::vector<DLDeviceType> params_device_type;
-    if (IsClosure(func)) {
-      // After lifting we'll have functions of the form:
-      //   fn(closure args) { fn(lifted function args) { body } }
-      // But we want the closure's function to be:
-      //   fn(closure args, lifter function args) { body }
-      // Do that flattening on-the-fly here.
-      Function inner_func = Downcast<Function>(func->body);
-      std::vector<Var> params;
-      std::vector<DLDeviceType> param_device_types;
-      params.reserve(func->params.size() + inner_func->params.size());
-      param_device_types.reserve(func->params.size() + inner_func->params.size());
-      for (size_t i = 0; i < func->params.size(); ++i) {
-        params.emplace_back(func->params[i]);
-        params_device_type.push_back(GetFunctionParamDeviceType(func.get(), i));
-      }
-      for (size_t i = 0; i < inner_func->params.size(); ++i) {
-        params.emplace_back(inner_func->params[i]);
-        params_device_type.push_back(GetFunctionParamDeviceType(inner_func.get(), i));
-      }
-      std::vector<TypeVar> type_params;
-      type_params.reserve(func->type_params.size() + inner_func->type_params.size());
-      for (const auto& tyvar : func->type_params) {
-        type_params.push_back(tyvar);
-      }
-      for (const auto& tyvar : inner_func->type_params) {
-        type_params.push_back(tyvar);
-      }
-      Function flattened_func = Function(params, inner_func->body, inner_func->ret_type,
-                                         type_params, func->attrs, func->span);
-      VisitExpr(MaybeFunctionOnDevice(flattened_func, params_device_type,
-                                      GetFunctionResultDeviceType(inner_func.get())));
-    } else {
-      params_device_type.reserve(func->params.size());
-      for (size_t i = 0; i < func->params.size(); ++i) {
-        params_device_type.push_back(GetFunctionParamDeviceType(func.get(), i));
-      }
-      VisitExpr(func);
+    size_t i = 0;
+    // We then assign register num to the free variables
+    for (auto param : func->params) {
+      auto arg_register = NewRegister();
+      ICHECK_EQ(i, arg_register);
+      var_register_map_.insert({param, arg_register});
+      params_.push_back(param->name_hint());
+      ++i;
     }
-    std::vector<Index> params_device_type_index;
-    params_device_type_index.reserve(params_device_type.size());
-    for (auto device_type : params_device_type) {
-      params_device_type_index.push_back(static_cast<Index>(device_type));
-    }
-    return VMFunction(var->name_hint, params_, instructions_, registers_num_,
-                      params_device_type_index);
-  }
 
+    if (IsClosure(func)) {
+      Function inner_func = Downcast<Function>(func->body);
+      for (auto param : inner_func->params) {
+        auto arg_register = NewRegister();
+        ICHECK_EQ(i, arg_register);
+        var_register_map_.insert({param, arg_register});
+        params_.push_back(param->name_hint());
+        ++i;
+      }
+      this->VisitExpr(inner_func->body);
+    } else {
+      this->VisitExpr(func->body);
+    }
+    instructions_.push_back(Instruction::Ret(last_register_));
+
+    std::vector<Index> params_device_type;
+    for (const auto& it : func->params) {
+      if (!expr_device_map_.empty()) {
+        ICHECK_GT(expr_device_map_.count(it), 0U);
+        params_device_type.push_back(expr_device_map_[it].device_type);
+      } else {
+        ICHECK_EQ(targets_.size(), 1U);
+        params_device_type.push_back((targets_.begin())->first);
+      }
+    }
+
+    return VMFunction(var->name_hint, params_, instructions_, registers_num_, params_device_type);
+  }
   /*! \brief Attrs objects for each op. */
   std::map<Index, Map<String, ObjectRef>> op_attrs;
 
@@ -322,7 +313,7 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
   size_t NewRegister() { return registers_num_++; }
 
   inline void Emit(const Instruction& instr) {
-    VLOG(2) << "VMCompiler::Emit: instr=" << instr;
+    DLOG(INFO) << "VMCompiler::Emit: instr=" << instr;
     ICHECK((int)instr.op < 100) << "Invalid opcode " << (int)instr.op;
     switch (instr.op) {
       case Opcode::AllocADT:
@@ -352,26 +343,29 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
     instructions_.push_back(instr);
   }
 
-  using DeviceAwareExprFunctor<void(const Expr&)>::VisitExpr_;
-
-  void VisitExpr_(const ConstantNode* const_node) final {
+  void VisitExpr_(const ConstantNode* const_node) {
     // Check the shape is valid
     NDArray data = const_node->data;
     size_t konst_idx = context_->constants.size();
-    auto con = GetRef<Constant>(const_node);
-    context_->const_device_type.push_back(GetInScopeDeviceType(con));
+    if (expr_device_map_.empty()) {
+      context_->const_device_type.push_back(targets_.begin()->first);
+    } else {
+      auto con = GetRef<Constant>(const_node);
+      ICHECK_GT(expr_device_map_.count(con), 0U);
+      context_->const_device_type.push_back(expr_device_map_[con].device_type);
+    }
     context_->constants.push_back(const_node->data);
     Emit(Instruction::LoadConst(konst_idx, NewRegister()));
   }
 
-  void VisitExpr_(const VarNode* var_node) final {
+  void VisitExpr_(const VarNode* var_node) {
     auto var = GetRef<Var>(var_node);
     auto reg_it = this->var_register_map_.find(var);
     ICHECK(reg_it != this->var_register_map_.end());
     last_register_ = reg_it->second;
   }
 
-  void VisitExpr_(const TupleNode* tuple_node) final {
+  void VisitExpr_(const TupleNode* tuple_node) {
     auto tuple = GetRef<Tuple>(tuple_node);
     std::vector<Index> fields_registers;
 
@@ -384,28 +378,33 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
     Emit(Instruction::AllocADT(0, tuple->fields.size(), fields_registers, NewRegister()));
   }
 
-  void VisitExpr_(const MatchNode* match_node) final {
+  void VisitExpr_(const MatchNode* match_node) {
     auto match = GetRef<Match>(match_node);
 
     this->VisitExpr(match->data);
     CompileMatch(match);
   }
 
-  void PreVisitLetBinding_(const Var& var, const Expr& value) final {
-    ICHECK(!value.as<FunctionNode>())
-        << "invariant violated, inner functions should not exist (did you set opt_level = 2?)";
-    VisitExpr(value);
-    var_register_map_.emplace(var, this->last_register_);
+  void VisitExpr_(const LetNode* l) final {
+    Expr let_binding = GetRef<Expr>(l);
+    const LetNode* let;
+    while ((let = let_binding.as<LetNode>())) {
+      VisitExpr(let->value);
+      var_register_map_.insert({let->var, this->last_register_});
+      let_binding = let->body;
+    }
+
+    VisitExpr(let_binding);
   }
 
-  void VisitExpr_(const TupleGetItemNode* get_node) final {
+  void VisitExpr_(const TupleGetItemNode* get_node) {
     auto get = GetRef<TupleGetItem>(get_node);
     this->VisitExpr(get->tuple);
     auto tuple_register = last_register_;
     Emit(Instruction::GetField(tuple_register, get->index, NewRegister()));
   }
 
-  void VisitExpr_(const GlobalVarNode* gvar) final {
+  void VisitExpr_(const GlobalVarNode* gvar) {
     auto var = GetRef<GlobalVar>(gvar);
     auto func = context_->module->Lookup(var);
     auto it = context_->global_map.find(var);
@@ -414,7 +413,7 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
     Emit(Instruction::AllocClosure(it->second, 0, {}, NewRegister()));
   }
 
-  void VisitExpr_(const IfNode* if_node) final {
+  void VisitExpr_(const IfNode* if_node) {
     this->VisitExpr(if_node->cond);
 
     size_t test_register = last_register_;
@@ -463,8 +462,8 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
 
   void EmitShapeFunc(Function func, Array<Expr> inputs, Array<Expr> outputs) {
     // Lower shape function
-    tec::CCacheKey key(func, target_host_);
-    auto cfunc = context_->compiler->LowerShapeFunc(key);
+    CCacheKey key(func, target_host_);
+    auto cfunc = engine_->LowerShapeFunc(key);
     int op_index = -1;
     // pick the only function inside the context
     ICHECK_EQ(cfunc->funcs->functions.size(), 1);
@@ -501,9 +500,8 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
   void EmitInvokeTVMOp(const Function& func, const Expr& inputs, const Expr& outputs) {
     std::vector<Index> argument_registers;
 
-    ICHECK(func->HasNonzeroAttr(attr::kPrimitive))
-        << "internal error: invoke_tvm_op requires the first argument to be a primitive "
-           "relay::Function";
+    ICHECK(func->GetAttr<Integer>(attr::kPrimitive, 0) != 0)
+        << "internal error: invoke_tvm_op requires the first argument to be a relay::Function";
 
     auto input_tuple = inputs.as<TupleNode>();
     ICHECK(input_tuple) << "internal error: invoke_tvm_op inputs must be a tuple,"
@@ -527,21 +525,30 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
 
     Target target;
 
-    // Which target should execute the function?
     if (func->GetAttr<String>(attr::kCompiler).defined()) {
       target = Target("ext_dev");
     } else {
-      int dev_type = GetInScopeDeviceType(func);
-      if (targets_.count(dev_type) == 0) {
-        target = CreateDefaultTarget(dev_type);
+      // Next generate the invoke instruction.
+      if (expr_device_map_.empty()) {
+        // homogeneous execution.
+        ICHECK_EQ(targets_.size(), 1U);
+        const auto& it = targets_.begin();
+        target = (*it).second;
       } else {
-        target = targets_[dev_type];
+        ICHECK_GT(expr_device_map_.count(func), 0U)
+            << "Found not annotated expression, please make sure "
+               "context analysis has been executed";
+        int dev_type = expr_device_map_[func].device_type;
+        if (targets_.count(dev_type) == 0) {
+          target = CreateDefaultTarget(dev_type);
+        } else {
+          target = targets_[expr_device_map_[func].device_type];
+        }
       }
     }
 
-    tec::CCacheKey key(func, target);
-    auto mangle_fn = [](String name) { return name; };
-    auto cfunc = context_->compiler->Lower(key, mangle_fn);  // <<<< one-func-at-a-time lowering
+    CCacheKey key(func, target);
+    auto cfunc = engine_->Lower(key);
 
     auto op_index = -1;
     if (func->GetAttr<String>(attr::kCompiler).defined()) {
@@ -567,7 +574,7 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
                                    argument_registers));
   }
 
-  void DeviceAwareVisitExpr_(const CallNode* call_node) final {
+  void VisitExpr_(const CallNode* call_node) {
     Expr op = call_node->op;
 
     // First we handle the case in which we are using an opaque
@@ -599,9 +606,8 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
                    auto offset_register = last_register_;
 
                    // If the shape is constant then we will emit a static tensor allocation
-                   // instruction. It may be wrapped by an on_device, but it will be on the host
-                   // which is assumed by the alloc_tensor instruction anyway.
-                   auto const_shape = AsIgnoringOnDevice<ConstantNode>(args[2]);
+                   // instruction.
+                   auto const_shape = args[2].as<ConstantNode>();
 
                    if (const_shape) {
                      NDArray shape = const_shape->data;
@@ -618,13 +624,14 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
                    }
                  })
           .Match("memory.alloc_storage",
-                 [this](const Array<Expr>& args, const Attrs& attrs, const Array<Type>& type_arg) {
+                 [this, call_node](const Array<Expr>& args, const Attrs& attrs,
+                                   const Array<Type>& type_arg) {
                    ICHECK_EQ(args.size(), 2);
                    // Compute the size of the allocation.
                    this->VisitExpr(args[0]);
                    auto size_register = last_register_;
 
-                   ICHECK(args[1].as<ConstantNode>());  // Always a literal.
+                   ICHECK(args[1].as<ConstantNode>());
                    NDArray alignment_arr = args[1].as<ConstantNode>()->data;
                    ICHECK_EQ(alignment_arr->dtype.code, 0U)
                        << "The dtype of constant shape must be int32 or int64, but got "
@@ -637,8 +644,20 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
                    ICHECK(alloc_attrs != nullptr) << "must be the AllocStorage attrs";
                    auto dtype = alloc_attrs->dtype;
 
-                   Emit(Instruction::AllocStorage(size_register, alignment, dtype,
-                                                  alloc_attrs->device_type, NewRegister()));
+                   Index device_type;
+                   if (expr_device_map_.empty()) {
+                     // TODO(zhiics) There is bug if all expressions are annotated with the device
+                     // that is different the first one in the target list.
+                     auto& kv = *(targets_.begin());
+                     device_type = kv.first;
+                   } else {
+                     ICHECK_GT(expr_device_map_.count(GetRef<Call>(call_node)), 0U)
+                         << " The alloc_storage node is not annotated";
+                     device_type = expr_device_map_[GetRef<Call>(call_node)].device_type;
+                   }
+
+                   Emit(Instruction::AllocStorage(size_register, alignment, dtype, device_type,
+                                                  NewRegister()));
                  })
           .Match("vm.shape_func",
                  [this](const Array<Expr>& args, const Attrs& attrs, const Array<Type>& type_arg) {
@@ -707,8 +726,8 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
       auto global = GetRef<GlobalVar>(global_node);
       auto it = context_->global_map.find(global);
       ICHECK(it != context_->global_map.end());
-      VLOG(2) << "VisitExpr_: generating invoke for " << global->name_hint
-              << " with func_index=" << it->second;
+      DLOG(INFO) << "VisitExpr_: generating invoke for " << global->name_hint
+                 << " with func_index=" << it->second;
 
       // TODO(tvm-team):
       // Think about mixed call into global that is not a relay::Function
@@ -743,32 +762,12 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
     }
   }
 
-  void DeviceAwareVisitExpr_(const FunctionNode* func_node) final {
-    if (function_nesting() > 1) {
-      ICHECK(func_node->HasNonzeroAttr(attr::kPrimitive))
-          << "local functions should have been removed by lambda lifting:" << std::endl
-          << "Program: " << AsText(GetRef<Function>(func_node), false) << std::endl
-          << "AST: " << GetRef<Function>(func_node);
-      return;
+  void VisitExpr_(const FunctionNode* func_node) {
+    if (!func_node->HasNonzeroAttr(attr::kPrimitive)) {
+      LOG(FATAL) << "local functions should have been removed by lambda lifting:" << std::endl
+                 << "Program: " << AsText(GetRef<Function>(func_node), false) << std::endl
+                 << "AST: " << GetRef<Function>(func_node);
     }
-
-    // We're processing a top-level function which has possibly been rejigged to capture
-    // both closure and function arguments. Those functions retain their 'Closure' attribute,
-    // but we can just process them like any other function here.
-
-    // Assign a register num to each parameter.
-    size_t i = 0;
-    for (auto param : func_node->params) {
-      auto arg_register = NewRegister();
-      ICHECK_EQ(i, arg_register);
-      var_register_map_.insert({param, arg_register});
-      params_.push_back(param->name_hint());
-      ++i;
-    }
-
-    VisitExpr(func_node->body);
-
-    instructions_.push_back(Instruction::Ret(last_register_));
   }
 
   /*!
@@ -829,7 +828,7 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
 
   /*!
    * \brief Compile a pattern match expression
-   * It first converts the pattern match expression into a decision tree, the condition
+   * It first converts the pattern match expression into a desicision tree, the condition
    * could be object comparison or variable binding. If any of the condition fails in a clause,
    * the decision tree switches to check the conditions of next clause and so on. If no clause
    * matches the value, a fatal node is inserted.
@@ -855,12 +854,16 @@ class VMFunctionCompiler : DeviceAwareExprFunctor<void(const Expr& n)> {
   size_t last_register_;
   /*! \brief Total number of virtual registers allocated. */
   size_t registers_num_;
+  /*! \brief Compiler engine to lower primitive functions. */
+  CompileEngine engine_;
   /*! \brief Global shared meta data */
   VMCompilerContext* context_;
   /*! \brief Target devices. */
   std::unordered_map<int, tvm::Target> targets_;
   /*! \brief Host target. */
   Target target_host_;
+  /*! \brief Map from Relay expr to device type. */
+  ExprDeviceMap expr_device_map_;
 };
 
 PackedFunc VMCompiler::GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self) {
@@ -908,8 +911,7 @@ void VMCompiler::SetParam(const std::string& name, runtime::NDArray data_in) {
   params_[name] = data_in;
 }
 
-void VMCompiler::Lower(IRModule mod, const tvm::TargetMap& targets,
-                       const tvm::Target& target_host) {
+void VMCompiler::Lower(IRModule mod, const TargetsMap& targets, const tvm::Target& target_host) {
   exec_ = make_object<Executable>();
   targets_ = targets;
   target_host_ = target_host;
@@ -928,11 +930,15 @@ void VMCompiler::Lower(IRModule mod, const tvm::TargetMap& targets,
   // the global state.
   exec_->functions.resize(context_.module->functions.size());
 
+  // Collect the annotated device information.
+  // This indicates which device each Relay expr should be executed on.
+  ExprDeviceMap expr_device_map = AnalyzeContext();
+
   for (auto named_func : context_.module->functions) {
     auto gvar = named_func.first;
     if (auto* n = named_func.second.as<FunctionNode>()) {
       auto func = GetRef<Function>(n);
-      VMFunctionCompiler func_compiler(&context_, targets_, target_host_);
+      VMFunctionCompiler func_compiler(&context_, targets_, target_host_, expr_device_map);
       auto vm_func = func_compiler.Compile(gvar, func);
 
       size_t func_index = context_.global_map.at(gvar);
@@ -945,6 +951,12 @@ void VMCompiler::Lower(IRModule mod, const tvm::TargetMap& targets,
       }
     }
   }
+
+#if USE_RELAY_DEBUG
+  for (auto vm_func : exec_->functions) {
+    DLOG(INFO) << vm_func << "-------------";
+  }
+#endif  // USE_RELAY_DEBUG
 
   // populate constants
   for (auto data : context_.constants) {
@@ -963,19 +975,11 @@ void VMCompiler::Lower(IRModule mod, const tvm::TargetMap& targets,
   // update primitive function map
   size_t primitive_index = 0;
   for (const auto& cfunc : context_.cached_funcs) {
-    exec_->primitive_map.insert({cfunc->prim_fn_var->name_hint, primitive_index++});
+    exec_->primitive_map.insert({cfunc->func_name, primitive_index++});
   }
-
-#if USE_RELAY_DEBUG
-  for (const auto& vm_func : exec_->functions) {
-    VLOG(1) << vm_func << "-------------";
-  }
-#endif  // USE_RELAY_DEBUG
-
-  backend::UpdateAutoSchedulerOpWeights(context_.compiler);
 }
 
-transform::Sequential MemoryOpt(tvm::Target host_target, tvm::TargetMap targets) {
+transform::Sequential MemoryOpt(tvm::Target host_target, TargetsMap targets) {
   Array<Pass> pass_seqs;
   // Remove unused functions
   Array<runtime::String> entry_functions{"main"};
@@ -1021,10 +1025,9 @@ transform::Sequential MemoryOpt(tvm::Target host_target, tvm::TargetMap targets)
   return transform::Sequential(pass_seqs);
 }
 
-IRModule VMCompiler::OptimizeModule(IRModule mod, const TargetMap& targets_arg,
+IRModule VMCompiler::OptimizeModule(IRModule mod, const TargetsMap& targets_arg,
                                     const Target& target_host_arg) {
-  VLOG_CONTEXT << "VMCompiler::OptimizeModule";
-  TargetMap targets = targets_arg;
+  TargetsMap targets = targets_arg;
   Target target_host = target_host_arg;
   CheckAndUpdateHostConsistency(&targets, &target_host);
   if (params_.size()) {
@@ -1036,20 +1039,65 @@ IRModule VMCompiler::OptimizeModule(IRModule mod, const TargetMap& targets_arg,
     mod->Add(gvar, f);
   }
 
-  Array<Pass> pass_seqs = relay::backend::GetPassPrefix(targets, true);
+  Array<Pass> pass_seqs;
+  Array<runtime::String> entry_functions{"main"};
+  pass_seqs.push_back(transform::RemoveUnusedFunctions(entry_functions));
+  pass_seqs.push_back(transform::ToBasicBlockNormalForm());
+  // Run all dialect legalization passes.
+  pass_seqs.push_back(relay::qnn::transform::Legalize());
 
-  // TODO(mbs): Reconcile with relay/backend/build_module.cc
-  DLDeviceType default_device_type;
-  if (targets_arg.size() == 1) {
-    default_device_type =
-        static_cast<DLDeviceType>(static_cast<int>((*targets_arg.begin()).first->value));
-  } else {
-    default_device_type = static_cast<DLDeviceType>(GetFallbackDevice());
+  // Legalize pass is restricted to homogeneous execution for now.
+  if (targets.size() == 1) {
+    pass_seqs.push_back(transform::Legalize());
   }
-  pass_seqs.push_back(PlanDevices(default_device_type));
+
+  // eta expand to support constructors in argument position
+  pass_seqs.push_back(transform::EtaExpand(
+      /* expand_constructor */ true, /* expand_global_var */ false));
+
+  pass_seqs.push_back(transform::SimplifyInference());
+  PackedFunc fskip = PackedFunc([](TVMArgs args, TVMRetValue* rv) {
+    Expr expr = args[0];
+    if (expr.as<CallNode>()) {
+      auto call_node = expr.as<CallNode>();
+      auto op_node = call_node->op.as<OpNode>();
+      if (op_node->name == "cast") {
+        auto attrs = call_node->attrs.as<CastAttrs>();
+        if (attrs->dtype == DataType::Int(32)) {
+          *rv = true;
+        }
+      }
+    }
+    *rv = false;
+  });
+  pass_seqs.push_back(transform::EliminateCommonSubexpr(fskip));
+  pass_seqs.push_back(transform::SimplifyExpr());
+  pass_seqs.push_back(transform::InlinePrimitives());
+
+  pass_seqs.push_back(transform::CombineParallelConv2D(3));
+  pass_seqs.push_back(transform::CombineParallelDense(3));
+  pass_seqs.push_back(transform::CombineParallelBatchMatmul(3));
+  pass_seqs.push_back(transform::FoldConstant());
+  pass_seqs.push_back(transform::FoldScaleAxis());
+  pass_seqs.push_back(transform::CanonicalizeCast());
+  pass_seqs.push_back(transform::CanonicalizeOps());
+
+  // Alter layout transformation is only applied to homogeneous execution yet.
+  if (targets.size() == 1) {
+    pass_seqs.push_back(transform::AlterOpLayout());
+  }
+
+  // Fast math optimizations.
+  pass_seqs.push_back(transform::FastMath());
+  pass_seqs.push_back(transform::FoldConstant());
+
+  if (targets_.size() > 1) {
+    // Handle heterogeneous compilation.
+    int fallback_dev = GetFallbackDevice();
+    pass_seqs.push_back(transform::RewriteAnnotatedOps(fallback_dev));
+  }
 
   pass_seqs.push_back(transform::FuseOps());
-
   // Do layout rewrite for auto-scheduler.
   transform::PassContext pass_ctx = PassContext::Current();
   if (backend::IsAutoSchedulerEnabled() && targets.size() == 1) {
@@ -1122,9 +1170,8 @@ void VMCompiler::Codegen() {
 
     if (target->kind->device_type == kDLExtDev) {
       // Collect metadata in functions that are handled by external codegen.
-      auto name = cfunc->prim_fn_var->name_hint;
-      ICHECK(mod->ContainGlobalVar(name));
-      Function func = Downcast<Function>(mod->Lookup(name));
+      ICHECK(mod->ContainGlobalVar(cfunc->func_name));
+      Function func = Downcast<Function>(mod->Lookup(cfunc->func_name));
       backend::UpdateConstants(func, &params_);
     } else if (funcs.count(target) == 0) {
       funcs.Set(target, mod);
@@ -1133,8 +1180,8 @@ void VMCompiler::Codegen() {
     }
   }
 
-  auto ext_mods = context_.compiler->LowerExternalFunctions();
-
+  auto compile_engine = CompileEngine::Global();
+  auto ext_mods = compile_engine->LowerExternalFunctions();
   runtime::Module lib;
   if (funcs.size() > 0) {
     lib = tvm::build(funcs, target_host_);
@@ -1145,6 +1192,26 @@ void VMCompiler::Codegen() {
   }
   lib = codegen::CreateMetadataModule(params_, lib, ext_mods, target_host_, runtime::Metadata());
   exec_->SetLib(lib);
+  CompileEngine::Global()->Clear();
+}
+
+ExprDeviceMap VMCompiler::AnalyzeContext() const {
+  Device default_device;
+  ExprDeviceMap expr_device_map;
+  if (targets_.size() > 1) {
+    int fallback_dev = GetFallbackDevice();
+    default_device.device_type = static_cast<DLDeviceType>(fallback_dev);
+    default_device.device_id = 0;
+    expr_device_map = ContextAnalysis(context_.module, default_device);
+  } else {
+    const auto& tgt = targets_.begin();
+    default_device.device_type = static_cast<DLDeviceType>((*tgt).first->value);
+    if (default_device.device_type != kDLCPU) {
+      default_device.device_id = 0;
+      expr_device_map = ContextAnalysis(context_.module, default_device);
+    }
+  }
+  return expr_device_map;
 }
 
 runtime::Module CreateVMCompiler() {

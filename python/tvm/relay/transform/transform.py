@@ -18,17 +18,17 @@
 """
 Relay pass transformation infrastructure.
 """
-import functools
-import inspect
 import types
+import inspect
+import functools
 import warnings
 
 import tvm.ir
-from tvm import relay, te
+from tvm import te
 from tvm.runtime import ndarray as _nd
 
+from tvm import relay
 from . import _ffi_api
-from ..backend.utils import mangle_module_name
 
 
 def build_config(opt_level=2, required_pass=None, disabled_pass=None, trace=None):
@@ -544,6 +544,27 @@ def MergeCompilerRegions():
     return _ffi_api.MergeCompilerRegions()
 
 
+def RewriteAnnotatedOps(fallback_device):
+    """Rewrite the annotated program where annotation operators, e.g.
+    `on_deivce`, mark which device an expression should be scheduled to.
+    This pass helps heterogeneous execution where different operators may need
+    to be allocated on various devices.
+
+    Parameters
+    ----------
+    fallback_device : int
+        The fallback device type. It is also used as the default device for
+        operators with no annotated device.
+
+    Returns
+    -------
+    ret: tvm.transform.Pass
+        The registered pass that rewrites an expression with annotated
+        `on_device` operators.
+    """
+    return _ffi_api.RewriteDeviceAnnotation(fallback_device)
+
+
 def ToANormalForm():
     """Turn Graph Normal Form expression into A Normal Form Expression.
     The scope of the root expression is the global scope.
@@ -693,7 +714,7 @@ def LambdaLift():
     return _ffi_api.LambdaLift()
 
 
-def PartitionGraph(mod_name="default"):
+def PartitionGraph():
     """Partition a Relay program into regions that can be executed on different
     backends.
 
@@ -702,8 +723,7 @@ def PartitionGraph(mod_name="default"):
     ret: tvm.transform.Pass
         The registered pass that partitions the Relay program.
     """
-    mod_name = mangle_module_name(mod_name)
-    return _ffi_api.PartitionGraph(mod_name)
+    return _ffi_api.PartitionGraph()
 
 
 def AnnotateTarget(targets, include_non_call_ops=True):
@@ -1072,7 +1092,7 @@ def DenseToSparse(weight_name, weight_shape):
     return _ffi_api.DenseToSparse(weight_name, weight_shape)
 
 
-def Conv2dToSparse(weight_name, weight_shape, layout, kernel_size):
+def Conv2dToSparse(weight_name, weight_shape, layout):
     """
     Rewrite qualified ```nn.conv2d operation``` to ```nn.sparse_conv2d```
 
@@ -1092,27 +1112,7 @@ def Conv2dToSparse(weight_name, weight_shape, layout, kernel_size):
     ret : tvm.transform.Pass
         The registered DenseToSparse pass.
     """
-    return _ffi_api.Conv2dToSparse(weight_name, weight_shape, layout, kernel_size)
-
-
-def Conv2dToSparse2(layout, kernel_size, blocksize, sparsity_threshold):
-    """
-    Rewrite freezed ```nn.conv2d``` operation to ```nn.sparse_conv2d```
-
-    Parameters
-    ----------
-    layout : str
-        layout of data
-
-    kernel_size : int
-        kernel size of conv2d
-
-    Returns
-    -------
-    ret : tvm.transform.Pass
-        The registered DenseToSparse pass.
-    """
-    return _ffi_api.Conv2dToSparse2(layout, kernel_size, *blocksize, sparsity_threshold)
+    return _ffi_api.Conv2dToSparse(weight_name, weight_shape, layout)
 
 
 def SimplifyFCTranspose(target_weight_name):
@@ -1146,16 +1146,6 @@ def SimplifyExpr():
     return _ffi_api.SimplifyExpr()
 
 
-def PlanDevices(default_device):
-    """
-    Uses existing "on_device" and "device_copy" CallNodes to infer the device on which
-    every Relay sub-expression should run (and the result stored). Captures the result of that
-    analysis using new "on_device" and "device_copy" CallNodes. Note that the device_id of
-    the default_device is ignored.
-    """
-    return _ffi_api.PlanDevices(default_device)
-
-
 def FoldExplicitPadding():
     """
     FoldExplicitPadding finds explict padding before an op that can support
@@ -1178,73 +1168,6 @@ def AnnotateSpans():
     Returns
     -------
     ret : tvm.transform.Pass
-        The registered AnnotateSpans pass.
+        The regsistered AnnotateSpans pass.
     """
     return _ffi_api.AnnotateSpans()
-
-
-def FakeQuantizationToInteger():
-    # pylint: disable=anomalous-backslash-in-string
-    """
-    Find regions of the graph of the form
-
-    .. code-block:: text
-
-        x    w
-        |    |
-        dq   dq
-         \\   /
-          op1
-           |
-          op2
-           |
-           q
-
-    where ``q == qnn.quantize`` and ``dq = qnn.dequantize``
-    and rewrite them into integer versions of ``op1`` and ``op2``
-
-    Rules for rewriting indivdual ops are in fake_quantization_to_integer.py
-
-    Returns
-    -------
-    ret : tvm.transform.Pass
-        The registered SimplifyExpr pass.
-    """
-    return _ffi_api.FakeQuantizationToInteger()
-
-
-def ToMixedPrecision(mixed_precision_type="float16", missing_op_mode=1):
-    """
-    Automatic mixed precision rewriter. Rewrite an FP32 relay graph into a version
-    where as many operations as possible are in the target mixed_precision_type.
-
-    Parameters
-    ----------
-    mixed_precision_type: str
-      The target datatype to transform operations in the graph to use.
-
-    missing_op_mode: int
-      Determines how to handle ops not registered with FTVMMixedPrecisionConversionType
-        0: Does not allow any missing ops. Will throw errors when encountering any.
-        1: Allow missing ops but emit warnings.
-        2: Allow missing ops and silently ignore them.
-
-    Returns
-    -------
-    ret : tvm.transform.Pass
-        The registered pass.
-    """
-    if missing_op_mode < 0 or missing_op_mode > 2:
-        raise ValueError("Missing op mode is either 0, 1, or 2")
-    return _ffi_api.ToMixedPrecision(mixed_precision_type, missing_op_mode)
-
-
-def SplitArgs(max_function_args):
-    """Split function with huge number of arguments to smaller pieces.
-
-    Returns
-    -------
-    ret : tvm.transform.Pass
-        The registered pass for constant folding.
-    """
-    return _ffi_api.SplitArgs(max_function_args)

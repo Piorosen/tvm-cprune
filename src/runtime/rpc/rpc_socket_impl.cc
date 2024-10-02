@@ -21,6 +21,7 @@
  * \file rpc_socket_impl.cc
  * \brief Socket based RPC implementation.
  */
+#include <tvm/runtime/container.h>
 #include <tvm/runtime/registry.h>
 
 #include <memory>

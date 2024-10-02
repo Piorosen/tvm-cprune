@@ -26,8 +26,6 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
-#include "ir_utils.h"
-
 namespace tvm {
 namespace tir {
 
@@ -75,6 +73,8 @@ class BufferAllocationLocator : public StmtExprMutator {
 
   Stmt VisitStmt_(const BlockNode* op) final {
     ICHECK(!op->init.defined());
+    bool is_root = is_root_;
+    is_root_ = false;
     Array<Buffer> alloc_buffers;
     auto it = alloc_buffers_.find(op);
     if (it != alloc_buffers_.end()) {
@@ -83,23 +83,11 @@ class BufferAllocationLocator : public StmtExprMutator {
         buffer_data_to_buffer_.Set(buf->data, buf);
       }
     }
-    for (const MatchBufferRegion match_buffer : op->match_buffers) {
-      const Var& target_var = match_buffer->buffer->data;
-      const Var& source_var = match_buffer->source->buffer->data;
-      ICHECK(buffer_data_to_buffer_.count(source_var));
-      buffer_data_to_buffer_.Set(target_var, match_buffer->buffer);
-    }
     Stmt stmt = StmtMutator::VisitStmt_(op);
     op = stmt.as<BlockNode>();
     ICHECK(op != nullptr);
 
-    // No longer consider buffers created by match_buffer inside the block when updating access
-    // region.
-    for (const MatchBufferRegion match_buffer : op->match_buffers) {
-      const Var& target_var = match_buffer->buffer->data;
-      buffer_data_to_buffer_.erase(target_var);
-    }
-    // No longer consider buffers allocated inside the block when updating access region.
+    // Ignore buffer allocated inside the block when getting access region.
     if (it != alloc_buffers_.end()) {
       for (const Buffer& buf : it->second) {
         buffer_data_to_buffer_.erase(buf->data);
@@ -108,9 +96,12 @@ class BufferAllocationLocator : public StmtExprMutator {
 
     ObjectPtr<BlockNode> n = CopyOnWrite(op);
     n->alloc_buffers = std::move(alloc_buffers);
-    // Erase buffer allocated inside the block from access region.
-    n->reads = RemoveRedundantBufferRegion(n->reads);
-    n->writes = RemoveRedundantBufferRegion(n->writes);
+    // The read/write regions of root block are always empty.
+    if (!is_root) {
+      // Recalculate block access region
+      CollectReadWrite(GetRef<Block>(op), &n->reads, &n->writes);
+    }
+
     return Stmt(n);
   }
 
@@ -129,40 +120,35 @@ class BufferAllocationLocator : public StmtExprMutator {
                        /*init=*/NullOpt,
                        /*alloc_buffers=*/alloc_buffers);
     ObjectPtr<BlockNode> n = CopyOnWrite(opaque_block.get());
-    Array<Array<BufferRegion>> access =
-        GetBlockReadWriteRegion(opaque_block, buffer_data_to_buffer_);
-    n->reads = access[0];
-    n->writes = access[1];
+    CollectReadWrite(opaque_block, &n->reads, &n->writes);
     BlockRealize realize({}, Bool(true), Block(n));
     return std::move(realize);
   }
 
-  Array<BufferRegion> RemoveRedundantBufferRegion(const Array<BufferRegion>& region) const {
-    Array<BufferRegion> result;
-    for (const BufferRegion& buffer_region : region) {
-      if (buffer_data_to_buffer_.count(buffer_region->buffer->data)) {
-        result.push_back(buffer_region);
-      }
+  void CollectReadWrite(const Block& block, Array<BufferRegion>* reads,
+                        Array<BufferRegion>* writes) {
+    Array<Array<BufferRegion>> access = GetBlockAccessRegion(block, buffer_data_to_buffer_);
+    *reads = access[0];
+    *writes = access[1];
+    for (const auto& opaque_access : access[2]) {
+      reads->push_back(opaque_access);
+      writes->push_back(opaque_access);
     }
-    return result;
   }
 
   /*! \brief The map from stmt to the buffers to be allocated under it. */
   std::unordered_map<const StmtNode*, Array<Buffer>> alloc_buffers_;
   /*! \brief The buffer already allocated during recursive visiting. */
   Map<Var, Buffer> buffer_data_to_buffer_;
+  /*! \brief indicate the whether the block is root. */
+  bool is_root_{true};
 };
 
 PrimFunc PlanAndUpdateBufferAllocationLocation(PrimFunc func) {
-  // Only apply this pass to TIR that is not from TE schedules
-  if (!IsFromLegacyTESchedule(func)) {
-    auto fptr = func.CopyOnWrite();
-    BufferAllocationLocator locator(func);
-    fptr->body = locator(fptr->body);
-    return func;
-  } else {
-    return func;
-  }
+  auto fptr = func.CopyOnWrite();
+  BufferAllocationLocator locator(func);
+  fptr->body = locator(fptr->body);
+  return func;
 }
 
 namespace transform {

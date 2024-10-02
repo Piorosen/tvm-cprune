@@ -178,7 +178,7 @@ Expr L2NormToInferUnpack(const Attrs attrs, Expr data) {
   return Divide(data, sqrt);
 }
 
-class InferenceSimplifier : public MixedModeMutator {
+class InferenceSimplifier : public ExprMutator {
  public:
   InferenceSimplifier()
       : batch_norm_op_(Op::Get("nn.batch_norm")),
@@ -188,7 +188,8 @@ class InferenceSimplifier : public MixedModeMutator {
         group_norm_op_(Op::Get("nn.group_norm")),
         l2_norm_op_(Op::Get("nn.l2_normalize")) {}
 
-  Expr Rewrite_(const TupleGetItemNode* n, const Expr& new_e) final {
+  Expr VisitExpr_(const TupleGetItemNode* n) final {
+    Expr new_e = ExprMutator::VisitExpr_(n);
     const auto* new_n = new_e.as<TupleGetItemNode>();
     if (new_n->index != 0) {
       return new_e;
@@ -204,7 +205,8 @@ class InferenceSimplifier : public MixedModeMutator {
     return new_e;
   }
 
-  Expr Rewrite_(const CallNode* n, const Expr& new_n) {
+  Expr VisitExpr_(const CallNode* n) {
+    auto new_n = ExprMutator::VisitExpr_(n);
     if (n->op == batch_norm_op_) {
       ty_map_[new_n.as<CallNode>()->args[0]] = n->args[0]->checked_type();
     } else if (n->op == layer_norm_op_) {

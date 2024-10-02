@@ -24,7 +24,7 @@
 #include <tvm/runtime/device_api.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/runtime/packed_func.h>
-#include <tvm/runtime/registry.h>
+#include <tvm/target/target.h>
 #include <vulkan/vulkan.h>
 
 #include <memory>
@@ -105,10 +105,6 @@ inline const char* VKGetErrorString(VkResult error) {
     VkResult __e = (func);   \
     VULKAN_CHECK_ERROR(__e); \
   }
-
-std::vector<const char*> FindEnabledExtensions(const std::vector<VkExtensionProperties>& ext_prop,
-                                               const std::vector<const char*>& required_extensions,
-                                               const std::vector<const char*>& optional_extensions);
 
 }  // namespace vulkan
 }  // namespace runtime

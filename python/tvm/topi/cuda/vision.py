@@ -39,9 +39,7 @@ def _default_schedule(outs):
                 traverse(tensor.op)
         scheduled_ops.append(op)
 
-    for o in outs:
-        traverse(o.op)
-
+    traverse(outs[0].op)
     return s
 
 

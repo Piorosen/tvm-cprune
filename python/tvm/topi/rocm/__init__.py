@@ -22,3 +22,4 @@ from __future__ import absolute_import as _abs
 from .batch_matmul import *
 from .conv2d import *
 from .dense import *
+from .nn import *

@@ -178,7 +178,7 @@ class MetalWrappedFunc {
   // initialize the METAL function.
   void Init(MetalModuleNode* m, ObjectPtr<Object> sptr, const std::string& func_name,
             size_t num_buffer_args, size_t num_pack_args,
-            const std::vector<std::string>& launch_param_tags) {
+            const std::vector<std::string>& thread_axis_tags) {
     w_ = metal::MetalWorkspace::Global();
     m_ = m;
     sptr_ = sptr;
@@ -186,14 +186,14 @@ class MetalWrappedFunc {
     num_buffer_args_ = num_buffer_args;
     num_pack_args_ = num_pack_args;
     std::fill(scache_.begin(), scache_.end(), (id<MTLComputePipelineState>)nil);
-    launch_param_config_.Init(num_buffer_args + num_pack_args, launch_param_tags);
+    thread_axis_cfg_.Init(num_buffer_args + num_pack_args, thread_axis_tags);
     metal::MetalThreadEntry* t = metal::MetalThreadEntry::ThreadLocal();
     int dev_id = t->device.device_id;
     scache_[dev_id] = m->GetPipelineState(dev_id, func_name);
   }
   // invoke the function with void arguments
   void operator()(TVMArgs args, TVMRetValue* rv, const ArgUnion64* pack_args) const {
-    AUTORELEASEPOOL {
+    @autoreleasepool {
       metal::MetalThreadEntry* t = metal::MetalThreadEntry::ThreadLocal();
       int device_id = t->device.device_id;
       auto stream = static_cast<metal::Stream*>(t->stream[device_id]);
@@ -201,7 +201,7 @@ class MetalWrappedFunc {
       if (scache_[device_id] == nil) {
         scache_[device_id] = m_->GetPipelineState(device_id, func_name_);
       }
-      ThreadWorkLoad wl = launch_param_config_.Extract(args);
+      ThreadWorkLoad wl = thread_axis_cfg_.Extract(args);
       int blockSize = wl.block_dim(0) * wl.block_dim(1) * wl.block_dim(2);
       auto maxTotalThreadsPerThreadgroup = scache_[device_id].maxTotalThreadsPerThreadgroup;
       CHECK_LE(blockSize, maxTotalThreadsPerThreadgroup);
@@ -223,7 +223,7 @@ class MetalWrappedFunc {
       [encoder dispatchThreadgroups:dimGrid threadsPerThreadgroup:dimBlock];
       [encoder endEncoding];
       [cb commit];
-    };
+    }
   }
 
  private:
@@ -242,39 +242,33 @@ class MetalWrappedFunc {
   // Device state cache per device.
   // mark as mutable, to enable lazy initialization
   mutable std::array<id<MTLComputePipelineState>, kMetalMaxNumDevice> scache_;
-  // launch parameters configuration
-  LaunchParamConfig launch_param_config_;
+  // thread axis configuration
+  ThreadAxisConfig thread_axis_cfg_;
 };
 
 PackedFunc MetalModuleNode::GetFunction(const std::string& name,
                                         const ObjectPtr<Object>& sptr_to_self) {
-  PackedFunc pf;
-  AUTORELEASEPOOL {
+  @autoreleasepool {
     ICHECK_EQ(sptr_to_self.get(), this);
     ICHECK_NE(name, symbol::tvm_module_main) << "Device function do not have main";
     auto it = fmap_.find(name);
-    if (it == fmap_.end()) {
-      pf = PackedFunc();
-      return;
-    }
+    if (it == fmap_.end()) return PackedFunc();
     const FunctionInfo& info = it->second;
     MetalWrappedFunc f;
     size_t num_buffer_args = NumBufferArgs(info.arg_types);
     f.Init(this, sptr_to_self, name, num_buffer_args, info.arg_types.size() - num_buffer_args,
-           info.launch_param_tags);
-    pf = PackFuncNonBufferArg(f, info.arg_types);
-  };
-  return pf;
+           info.thread_axis_tags);
+    return PackFuncNonBufferArg(f, info.arg_types);
+  }
 }
 
 Module MetalModuleCreate(std::string data, std::string fmt,
                          std::unordered_map<std::string, FunctionInfo> fmap, std::string source) {
-  ObjectPtr<Object> n;
-  AUTORELEASEPOOL {
+  @autoreleasepool {
     metal::MetalWorkspace::Global()->Init();
-    n = make_object<MetalModuleNode>(data, fmt, fmap, source);
-  };
-  return Module(n);
+    auto n = make_object<MetalModuleNode>(data, fmt, fmap, source);
+    return Module(n);
+  }
 }
 
 // Load module from module.

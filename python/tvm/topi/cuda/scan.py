@@ -231,7 +231,7 @@ def get_reduction_from_exclusive_scan(data, ex_scan_output, binop=tvm.tir.generi
                         data[tid * scan_axis_size + scan_axis_size - 1],
                     )
                 with ib.else_scope():
-                    reduction[tid] = cast(0, reduction.dtype)
+                    reduction[tid] = 0
 
         return ib.get()
 

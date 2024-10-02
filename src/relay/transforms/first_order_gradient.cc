@@ -174,14 +174,11 @@ struct FirstOrderReverseAD : ExprFunctor<ADValue(const Expr&)> {
   }
 
   ADValue VisitExpr_(const TupleGetItemNode* op) final {
+    Expr e = GetRef<Expr>(op);
     ADValue tup = VisitExpr(op->tuple);
-    TupleType tt = Downcast<TupleType>(op->tuple->checked_type());
+    auto tt = op->tuple->checked_type().as<TupleTypeNode>();
     size_t idx = op->index;
-    // reconstruct projection using let-bound variable to avoid duplicating input tuple
-    TupleGetItem orig = TupleGetItem(tup->get<ADTensor>().forward, idx);
-    orig->checked_type_ = op->checked_type();
-    auto ret = std::make_shared<ADTensor>(ll, orig, diag_ctx);
-    // for orig = pi(tup, i), pi_grad(tup, i, g) = G where pi(G, i) = g and pi(G, j) = 0 for j != i
+    auto ret = std::make_shared<ADTensor>(ll, e, diag_ctx);
     backprop_actions.push_back([tup, tt, idx, ret](LetList* ll) {
       auto& ad_tup = tup->get<ADTensor>();
       std::vector<Expr> updated_grads;
@@ -196,26 +193,16 @@ struct FirstOrderReverseAD : ExprFunctor<ADValue(const Expr&)> {
   }
 
   ADValue VisitExpr_(const TupleNode* op) final {
-    auto tt = Downcast<TupleType>(op->checked_type());
-    std::vector<ADValue> ad_fields;
-    std::vector<Expr> field_bindings;
+    Expr e = GetRef<Expr>(op);
+    std::vector<ADValue> fields;
     for (const auto& f : op->fields) {
-      ADValue f_ad = VisitExpr(f);
-      if (!dynamic_cast<ADTensor*>(f_ad.get())) {
-        diag_ctx.EmitFatal(Diagnostic::Error(f->span)
-                           << "first-order AD only supports (nested) tuples of tensors");
-      }
-      ad_fields.push_back(f_ad);
-      field_bindings.push_back(f_ad->get<ADTensor>().forward);
+      fields.push_back(VisitExpr(f));
     }
-    // reconstruct tuple using let-bound variables to avoid duplication
-    auto orig = Tuple(field_bindings);
-    orig->checked_type_ = tt;
-    auto ret = std::make_shared<ADTensor>(ll, orig, diag_ctx);
-    // for orig = tuple(x1, ..., xn), tuple_grad(x1, ..., xn, G) = [pi(G, 1), ..., pi(G, n)]
-    backprop_actions.push_back([ad_fields, tt, ret](LetList* ll) {
-      for (size_t i = 0; i < ad_fields.size(); ++i) {
-        auto& ad_field = ad_fields[i]->get<ADTensor>();
+    auto tt = op->checked_type().as<TupleTypeNode>();
+    auto ret = std::make_shared<ADTensor>(ll, e, diag_ctx);
+    backprop_actions.push_back([fields, tt, ret](LetList* ll) {
+      for (size_t i = 0; i < fields.size(); ++i) {
+        auto& ad_field = fields[i]->get<ADTensor>();
         ad_field.reverse =
             LiftedAdd(tt->fields[i], ad_field.reverse, GetField(ret->reverse, i), ll);
       }

@@ -17,18 +17,18 @@
 """ Operation class for computation declaration."""
 # pylint: disable=invalid-name
 from numbers import Integral as _Integral
-from typing import List, Union
+from typing import List
 
 import tvm._ffi
-from tvm._ffi.base import string_types
-from tvm.ir import Array
-from tvm.runtime import convert
 import tvm.tir
 import tvm.tir._ffi_api
 
-from . import _ffi_api
+from tvm._ffi.base import string_types
+from tvm.runtime import convert
+
 from . import tag as _tag
 from . import tensor as _tensor
+from . import _ffi_api
 
 
 def placeholder(shape, dtype=None, name="placeholder"):
@@ -226,12 +226,12 @@ def extern(
         .. note::
              **Parameters**
 
-             - **ins** (list of :any:`tvm.tir.Buffer`) - Placeholder for each inputs
-             - **outs** (list of :any:`tvm.tir.Buffer`) - Placeholder for each outputs
+             - **ins** (list of :any:`Buffer`) - Placeholder for each inputs
+             - **outs** (list of :any:`Buffer`) - Placeholder for each outputs
 
              **Returns**
 
-             - **stmt** (:any:`tvm.tir.Stmt`) - The statement that carries out array computation.
+             - **stmt** (:any:`Stmt`) - The statement that carries out array computation.
 
     name: str, optional
         The name hint of the tensor
@@ -240,10 +240,10 @@ def extern(
         The data types of outputs,
         by default dtype will be same as inputs.
 
-    in_buffers: tvm.tir.Buffer or list of tvm.tir.Buffer, optional
+    in_buffers: Buffer or list of Buffer, optional
         Input buffers.
 
-    out_buffers: tvm.tir.Buffer or list of tvm.tir.Buffer, optional
+    out_buffers: Buffer or list of Buffers, optional
         Output buffers.
 
 
@@ -431,7 +431,6 @@ def reduce_axis(dom, name="rv", thread_tag="", span=None):
 
 def create_prim_func(ops: List[_tensor.Tensor]) -> tvm.tir.PrimFunc:
     """Create a TensorIR PrimFunc from tensor expression
-
     Parameters
     ----------
     ops : List[Tensor]
@@ -445,15 +444,12 @@ def create_prim_func(ops: List[_tensor.Tensor]) -> tvm.tir.PrimFunc:
 
         import tvm
         from tvm import te
-        from tvm.te import create_prim_func
-        import tvm.script
 
         A = te.placeholder((128, 128), name="A")
         B = te.placeholder((128, 128), name="B")
-        k = te.reduce_axis((0, 128), "k")
         C = te.compute((128, 128), lambda x, y: te.sum(A[x, k] * B[y, k], axis=k), name="C")
         func = create_prim_func([A, B, C])
-        print(func.script())
+        print(tvm.script.asscript(func))
 
     If we want to use TensorIR schedule to do transformations on such kernel,
     we need to use `create_prim_func([A, B, C])` to create a schedulable PrimFunc.
@@ -461,44 +457,22 @@ def create_prim_func(ops: List[_tensor.Tensor]) -> tvm.tir.PrimFunc:
 
     .. code-block:: python
 
-        @T.prim_func
-        def tir_matmul(a: T.handle, b: T.handle, c: T.handle) -> None:
-            A = T.match_buffer(a, (128, 128))
-            B = T.match_buffer(b, (128, 128))
-            C = T.match_buffer(c, (128, 128))
+        @tvm.script.tir
+        def tir_matmul(a: ty.handle, b: ty.handle, c: ty.handle) -> None:
+            A = tir.match_buffer(a, (128, 128))
+            B = tir.match_buffer(b, (128, 128))
+            C = tir.match_buffer(c, (128, 128))
 
-            for i, j, k in T.grip(128, 128, 128):
-                with T.block():
-                    vi, vj, vk = T.axis.remap("SSR", [i, j, k])
-                    with T.init():
-                        C[vi, vj] = 0.0
-                    C[vi, vj] += A[vi, vk] * B[vj, vk]
+            with tir.block([128, 128, tir.reduce_axis(0, 128)]) as [i, j, k]:
+                with tir.init():
+                    C[i, j] = 0.0
+                C[i, j] += A[i, k] * B[j, k]
 
     Returns
     -------
     func : tir.PrimFunc
         The created function.
     """
-    if not isinstance(ops, (list, tuple, Array)):
+    if not isinstance(ops, list):
         ops = [ops]
     return _ffi_api.CreatePrimFunc(ops)
-
-
-def create_prim_func_from_outputs(
-    outputs: Union[_tensor.Tensor, List[_tensor.Tensor]],
-) -> tvm.tir.PrimFunc:
-    """Create a TensorIR PrimFunc from output tensor(s) in TE
-
-    Parameters
-    ----------
-    outputs : Union[Tensor, List[Tensor]]
-        The source expression.
-
-    Returns
-    -------
-    func : tir.PrimFunc
-        The created function.
-    """
-    if not isinstance(outputs, (list, tuple, Array)):
-        outputs = [outputs]
-    return _ffi_api.CreatePrimFuncFromOutputs(outputs)

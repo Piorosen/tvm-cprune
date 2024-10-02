@@ -35,7 +35,6 @@
 #include <utility>
 #include <vector>
 
-#include "../../transforms/infer_layout_utils.h"
 #include "../make_op.h"
 
 namespace tvm {
@@ -168,12 +167,11 @@ bool ConcatenateRel(const Array<Type>& types, int num_inputs, const Attrs& attrs
   return true;
 }
 
-static inline InferCorrectLayoutOutput ConcatenateLayout(
-    const Attrs& attrs, const Array<Layout>& new_in_layouts, const Array<Layout>& old_in_layouts,
-    const Array<tvm::relay::Type>& old_in_types) {
-  const auto* attrs_ptr = attrs.as<ConcatenateAttrs>();
-  ICHECK(attrs_ptr);
-  ObjectPtr<ConcatenateAttrs> param = make_object<ConcatenateAttrs>(*attrs_ptr);
+static inline Array<Array<Layout>> ConcatenateLayout(const Attrs& attrs,
+                                                     const Array<Layout>& new_in_layouts,
+                                                     const Array<Layout>& old_in_layouts,
+                                                     const Array<tvm::relay::Type>& old_in_types) {
+  ConcatenateAttrs* param = const_cast<ConcatenateAttrs*>(attrs.as<ConcatenateAttrs>());
 
   Array<Array<IndexExpr>> old_in_shapes;
   ICHECK_EQ(old_in_types.size(), 1);
@@ -218,11 +216,11 @@ static inline InferCorrectLayoutOutput ConcatenateLayout(
     }
 
     if (ret.ndim() <= axis || !ret[axis].IsPrimal()) {
-      return InferCorrectLayoutOutput({Layout::Undef()}, {Layout::Undef()}, attrs);
+      return Array<Array<Layout>>{{Layout::Undef()}, {Layout::Undef()}};
     }
   }
 
-  return InferCorrectLayoutOutput(Array<Layout>(old_in_layouts.size(), ret), {ret}, Attrs(param));
+  return Array<Array<Layout>>{Array<Layout>(old_in_layouts.size(), ret), {ret}};
 }
 
 /*!

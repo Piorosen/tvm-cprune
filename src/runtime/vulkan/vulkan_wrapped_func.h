@@ -32,7 +32,7 @@
 #include "../thread_storage_scope.h"
 #include "vulkan/vulkan_core.h"
 #include "vulkan_common.h"
-#include "vulkan_device.h"
+#include "vulkan_context.h"
 #include "vulkan_shader.h"
 
 namespace tvm {
@@ -40,7 +40,7 @@ namespace runtime {
 namespace vulkan {
 
 struct VulkanPipeline {
-  VulkanDevice* device{nullptr};
+  VulkanContext* vctx_{nullptr};
   VkShaderModule shader{VK_NULL_HANDLE};
   VkDescriptorSetLayout descriptor_set_layout{VK_NULL_HANDLE};
   VkDescriptorPool descriptor_pool{VK_NULL_HANDLE};
@@ -58,7 +58,7 @@ class VulkanWrappedFunc {
  public:
   void Init(VulkanModuleNode* m, ObjectPtr<Object> sptr, const std::string& func_name,
             size_t num_buffer_args, size_t num_pack_args,
-            const std::vector<std::string>& launch_param_tags);
+            const std::vector<std::string>& thread_axis_tags);
 
   void operator()(TVMArgs args, TVMRetValue* rv, const ArgUnion64* pack_args) const;
 
@@ -73,10 +73,11 @@ class VulkanWrappedFunc {
   size_t num_buffer_args_;
   // number of packed arguments.
   size_t num_pack_args_;
-  // launch parameters configuration
-  LaunchParamConfig launch_param_config_;
   // Device state cache per device.
   // mark as mutable, to enable lazy initialization
+  // thread axis configuration
+  ThreadAxisConfig thread_axis_cfg_;
+
   mutable std::array<std::shared_ptr<VulkanPipeline>, kVulkanMaxNumDevice> scache_;
 };
 

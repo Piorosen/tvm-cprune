@@ -25,6 +25,7 @@
 #ifndef TVM_TARGET_METADATA_MODULE_H_
 #define TVM_TARGET_METADATA_MODULE_H_
 
+#include <tvm/runtime/container.h>
 #include <tvm/runtime/module.h>
 #include <tvm/runtime/ndarray.h>
 #include <tvm/target/target.h>

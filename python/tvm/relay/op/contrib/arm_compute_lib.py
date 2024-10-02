@@ -397,14 +397,6 @@ def qnn_dense(expr):
     return True
 
 
-def check_dilation(attrs):
-    """Prevents offloading if dilation other than (1, 1)"""
-    if not isinstance(attrs, relay.op.op_attrs.GlobalPool2DAttrs):
-        if not (len(attrs.dilation) == 2 and attrs.dilation[0] == 1 and attrs.dilation[1] == 1):
-            return False
-    return True
-
-
 @tvm.ir.register_op_attr("nn.max_pool2d", "target.arm_compute_lib")
 def max_pool2d(expr):
     """Check if the external ACL codegen for maxpool2d should be used."""
@@ -414,7 +406,7 @@ def max_pool2d(expr):
     typ = args[0].checked_type
     if typ.dtype not in ["float32", "uint8"]:
         return False
-    return check_dilation(attrs)
+    return True
 
 
 @tvm.ir.register_op_attr("nn.avg_pool2d", "target.arm_compute_lib")
@@ -432,7 +424,7 @@ def avg_pool2d(expr, from_quantized_composite=False):
     if attrs.layout != "NHWC":
         return False
 
-    return check_dilation(attrs)
+    return True
 
 
 @tvm.ir.register_op_attr("nn.global_max_pool2d", "target.arm_compute_lib")
@@ -491,7 +483,7 @@ def qnn_add(expr):
 
 
 class OpAttrContext(object):
-    """Temporarily changes the attr of an op."""
+    """ Temporarily changes the attr of an op. """
 
     def __init__(self, op_name, attr_key, attr_value):
         """Saves the required info for RAII pattern usage.

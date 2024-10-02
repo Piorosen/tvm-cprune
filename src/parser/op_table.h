@@ -28,6 +28,7 @@
 #define TVM_PARSER_OP_TABLE_H_
 
 #include <tvm/ir/op.h>
+#include <tvm/runtime/container.h>
 #include <tvm/runtime/object.h>
 
 #include <fstream>
