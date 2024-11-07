@@ -17,6 +17,7 @@
 # coding: utf-8
 # pylint: disable=invalid-name, protected-access, too-many-branches, global-statement, unused-import
 """Function configuration API."""
+import time
 import ctypes
 import traceback
 from numbers import Number, Integral
