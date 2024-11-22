@@ -349,10 +349,7 @@ class TaskScheduler:
 
         # restore the status of the task scheduler from a log file
         if self.load_log_file:
-            self._restore_status(self.load_log_file, self.num_measures_per_round)
-            if fast_tune:
-                self.compute_prune_num()
-                return
+            self._restore_status(self.load_log_file, self.num_measures_per_round, not fast_tune)
 
         # make one search policy for one task
         self.search_policies = make_search_policies(
@@ -699,7 +696,7 @@ class TaskScheduler:
             self.task_tags[task_idx] = None
             group_ids.remove(task_idx)
 
-    def _restore_status(self, log_file, num_measures_per_round):
+    def _restore_status(self, log_file, num_measures_per_round, all_search: bool = False):
         """restore task_cts and best_costs from a log file"""
         str_target = str(self.tasks[0].target)
         workload_key_to_task_id = {t.workload_key: i for i, t in enumerate(self.tasks)}
@@ -729,7 +726,8 @@ class TaskScheduler:
             
         for idx in range(len(self.tasks)):
             if (self.task_cts[idx] - self.task_best_cts[idx] > self.early_stopping_task) or self.task_cts[idx] > 0:
-                self.dead_tasks.add(idx)
+                if not all_search:
+                    self.dead_tasks.add(idx)
 
             # The computation of taks_cts is just an estimation.
             # The estimation may not be accurate if the log file is changed externally or
