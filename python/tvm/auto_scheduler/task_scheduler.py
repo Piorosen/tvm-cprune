@@ -296,6 +296,7 @@ class TaskScheduler:
         search_policy_params=None,
         adapative_training=False,
         per_task_early_stopping=None,
+        fast_tune=False,
     ):
         """Tune a batch of tasks together.
 
@@ -349,6 +350,9 @@ class TaskScheduler:
         # restore the status of the task scheduler from a log file
         if self.load_log_file:
             self._restore_status(self.load_log_file, self.num_measures_per_round)
+            if fast_tune:
+                self.compute_prune_num()
+                return
 
         # make one search policy for one task
         self.search_policies = make_search_policies(
@@ -515,8 +519,11 @@ class TaskScheduler:
             elif all(avoid > 0 for avoid in avoid_tasks):
                 if self.tune_option.verbose >= 1:
                     print("All tasks finished tuning")
-                break      
+                break    
+            
+        self.compute_prune_num()  
 
+    def compute_prune_num(self):
         core_key = {} # Filtering and Finding Convolution Layer 
         # Convolution Layer has ff and ax (ff is i dont know but, that means Conv2d)
         # ax may be actually... relu but ...
@@ -697,7 +704,8 @@ class TaskScheduler:
         str_target = str(self.tasks[0].target)
         workload_key_to_task_id = {t.workload_key: i for i, t in enumerate(self.tasks)}
         total_ct = -1
-
+        self.best_measure_inputs = [None for _ in range(len(self.tasks))]
+        
         for total_ct, (inp, res) in enumerate(RecordReader(log_file)):
             if str(inp.task.target) != str_target:
                 continue
@@ -706,15 +714,21 @@ class TaskScheduler:
                 continue
 
             self.task_cts[task_idx] += 1
-
+            
             if res.error_no == 0:
                 cost = array_mean(res.costs)
                 if cost < self.best_costs[task_idx]:
                     self.best_costs[task_idx] = cost
                     self.task_best_cts[task_idx] = self.task_cts[task_idx]
-
+                    self.best_measure_inputs[task_idx] = inp
+        
+        for task_idx in range(len(self.best_measure_inputs)):
+            from .measure import recover_measure_input
+            if self.best_measure_inputs[task_idx] != None:
+                self.best_measure_inputs[task_idx] = recover_measure_input(self.best_measure_inputs[task_idx], True)
+            
         for idx in range(len(self.tasks)):
-            if self.task_cts[idx] - self.task_best_cts[idx] > self.early_stopping_task:
+            if (self.task_cts[idx] - self.task_best_cts[idx] > self.early_stopping_task) or self.task_cts[idx] > 0:
                 self.dead_tasks.add(idx)
 
             # The computation of taks_cts is just an estimation.
