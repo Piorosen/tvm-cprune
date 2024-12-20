@@ -39,6 +39,7 @@ from .utils import calc_workload_dis_factor, decode_workload_key
 
 logger = logging.getLogger("auto_scheduler")
 
+DATA_FILE_NAME = '/work/tmp_get_error_from_tvm.txt'
 
 class DispatchContext(object):
     """
@@ -433,7 +434,10 @@ class FallbackContext(DispatchContext):
                 f"which may bring great performance regression or even compilation failure. "
                 f"Compute DAG info:\n{dag}"
             )
-            with open('/work/tmp_get_error_from_tvm.txt', 'at+') as f:
+            if DATA_FILE_NAME == '/work/tmp_get_error_from_tvm.txt':
+                raise
+            
+            with open(DATA_FILE_NAME, 'at+') as f:
                 f.write(workload_key + '\n')
                 
             if msg not in self.messages:
